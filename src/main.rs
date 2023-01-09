@@ -46,6 +46,9 @@ const REALTIME_PROCESSES: &[&str] = &[
     "/usr/bin/gnome-system-monitor",
     "/usr/bin/i3lock",
     "/usr/lib/systemd/systemd-oomd",
+    "/usr/bin/ksysguard",
+    "/usr/lib/ksysguard/ksgrd_network_helper",
+    "/usr/bin/ksysguardd",
 ];
 
 const MLOCKALL_PROCESSES: &[&str] = &[
