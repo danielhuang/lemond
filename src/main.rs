@@ -63,10 +63,11 @@ const MLOCKALL_PROCESSES: &[&str] = &[
 const LOW_PRIORITY_PROCESSES: &[&str] = &["rustc", "cc", "c++", "gcc", "g++", "makepkg", "cc1"];
 
 const SCHED_IDLEPRIO: i32 = 5;
+const SCHED_DEADLINE: i32 = 6;
 
 const SOCKET_PATH: &str = "/run/lemond.socket";
 
-const REALTIME_NICE: i32 = -11;
+const REALTIME_NICE: i32 = -15;
 const BOOST_NICE: i32 = -5;
 const LOW_PRIORITY_NICE: i32 = 19;
 
@@ -167,13 +168,13 @@ fn set_realtime(p: &ProcessHandle, pid: u32) -> Result<()> {
     if REALTIME_RR {
         set_scheduler(
             pid,
-            libc::SCHED_RR,
+            libc::SCHED_FIFO,
             REALTIME_NICE,
             99 - i as i32,
             !is_lemond,
         )?;
     } else {
-        set_scheduler(pid, libc::SCHED_OTHER, REALTIME_NICE, 0, !is_lemond)?;
+        set_scheduler(pid, SCHED_DEADLINE, REALTIME_NICE, 0, !is_lemond)?;
     }
     Ok(())
 }
@@ -234,6 +235,9 @@ fn should_be_realtime(p: &ProcessHandle, state: Option<&State>) -> bool {
         if p.pid == pid {
             return true;
         }
+    }
+    if p.pid == std::process::id() {
+        return true;
     }
     let exe = &p.executable;
     if let Some(exe) = exe {
@@ -331,28 +335,24 @@ fn cleanup() -> Result<()> {
     Ok(())
 }
 
-fn cfs_tweaks(revert: Option<Vec<usize>>) -> Result<Vec<usize>> {
-    let cpus = num_cpus::get();
-    let score = 40;
-
+fn kernel_tweaks(revert: Option<Vec<String>>) -> Result<Vec<String>> {
     let values = vec![
-        ("/sys/kernel/debug/sched/latency_ns", 1000 * cpus * score),
-        (
-            "/sys/kernel/debug/sched/min_granularity_ns",
-            400 * cpus * score,
-        ),
-        (
-            "/sys/kernel/debug/sched/wakeup_granularity_ns",
-            500 * cpus * score,
-        ),
-        (
-            "/sys/kernel/debug/sched/idle_min_granularity_ns",
-            750 * cpus * score,
-        ),
-        (
-            "/sys/kernel/debug/sched/migration_cost_ns",
-            1500 * cpus * score,
-        ),
+        ("/proc/sys/vm/compaction_proactiveness", "0"),
+        ("/proc/sys/vm/min_free_kbytes", "1048576"),
+        ("/proc/sys/vm/swappiness", "10"),
+        ("/proc/sys/vm/zone_reclaim_mode", "0"),
+        ("/sys/kernel/mm/transparent_hugepage/enabled", "never"),
+        ("/sys/kernel/mm/transparent_hugepage/shmem_enabled", "never"),
+        ("/sys/kernel/mm/transparent_hugepage/khugepaged/defrag", "0"),
+        ("/proc/sys/vm/page_lock_unfairness", "1"),
+        ("/proc/sys/kernel/sched_child_runs_first", "0"),
+        ("/proc/sys/kernel/sched_autogroup_enabled", "1"),
+        ("/proc/sys/kernel/sched_cfs_bandwidth_slice_us", "500"),
+        ("/sys/kernel/debug/sched/latency_ns ", "1000000"),
+        ("/sys/kernel/debug/sched/migration_cost_ns", "500000"),
+        ("/sys/kernel/debug/sched/min_granularity_ns", "500000"),
+        ("/sys/kernel/debug/sched/wakeup_granularity_ns ", "0"),
+        ("/sys/kernel/debug/sched/nr_migrate", "8"),
     ];
 
     if let Some(revert) = revert {
@@ -369,7 +369,7 @@ fn cfs_tweaks(revert: Option<Vec<usize>>) -> Result<Vec<usize>> {
 
         for (path, num) in values {
             let prev_value = read_to_string(path)?;
-            prev.push(prev_value.trim().parse()?);
+            prev.push(prev_value);
 
             let mut file = File::create(path)?;
             write!(&mut file, "{num}")?;
@@ -400,7 +400,7 @@ fn main() {
     }
 
     let cfs_tweaks_prev = if ENABLE_CFS_TWEAKS {
-        handle_error(cfs_tweaks(None))
+        handle_error(kernel_tweaks(None))
     } else {
         None
     };
@@ -425,7 +425,7 @@ fn main() {
                 }
 
                 if let Some(cfs_tweaks_prev) = cfs_tweaks_prev {
-                    handle_error(cfs_tweaks(Some(cfs_tweaks_prev)));
+                    handle_error(kernel_tweaks(Some(cfs_tweaks_prev)));
                 }
 
                 exit(0);
