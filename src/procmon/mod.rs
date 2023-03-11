@@ -62,6 +62,13 @@ impl ProcMon {
     }
 }
 
+impl Drop for ProcMon {
+    fn drop(&mut self) {
+        let fd = self.nl_socket;
+        assert!(unsafe { libc::close(fd) } == 0);
+    }
+}
+
 impl Default for ProcMon {
     fn default() -> Self {
         Self::new()
