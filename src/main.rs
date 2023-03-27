@@ -1,5 +1,3 @@
-#![feature(hash_drain_filter, once_cell, try_blocks)]
-
 use cancellable_timer::Timer;
 use color_eyre::eyre::Result;
 use color_eyre::{Help, Report};
@@ -100,6 +98,11 @@ fn parents(x: &ProcessHandle, process_cache: &ProcessCache) -> Vec<ProcessHandle
 const SCHED_FLAG_RESET_ON_FORK: u64 = 0x01;
 const SCHED_FLAG_RECLAIM: u64 = 0x02;
 
+// from kernel
+const SCHED_FIXEDPOINT_SHIFT: u32 = 10;
+const SCHED_CAPACITY_SHIFT: u32 = SCHED_FIXEDPOINT_SHIFT;
+const SCHED_CAPACITY_SCALE: u32 = 1 << SCHED_CAPACITY_SHIFT;
+
 #[repr(C)]
 struct sched_attr {
     size: u32,
@@ -107,16 +110,23 @@ struct sched_attr {
     sched_policy: u32,
     sched_flags: u64,
 
-    /* SCHED_NORMAL, SCHED_BATCH */
+    // SCHED_NORMAL, SCHED_BATCH
     sched_nice: i32,
 
-    /* SCHED_FIFO, SCHED_RR */
+    // SCHED_FIFO, SCHED_RR
     sched_priority: u32,
 
-    /* SCHED_DEADLINE (nsec) */
+    // SCHED_DEADLINE (nsec)
     sched_runtime: u64,
     sched_deadline: u64,
     sched_period: u64,
+
+    // Utilization hints
+    sched_util_min: u32,
+    sched_util_max: u32,
+
+    // latency-nice patch
+    sched_latency_nice: i32,
 }
 
 fn set_nice(pid: u32, nice: i32) -> Result<()> {
@@ -146,6 +156,9 @@ fn set_scheduler(pid: u32, policy: i32, nice: i32, prio: i32, reset_on_fork: boo
         sched_runtime: NS_PER_MS * 2,
         sched_deadline: NS_PER_MS * 2,
         sched_period: NS_PER_MS * 2,
+        sched_util_min: 0,
+        sched_util_max: SCHED_CAPACITY_SCALE - 1,
+        sched_latency_nice: nice,
     };
 
     let result = unsafe { syscall!(Sysno::sched_setattr, pid, &attr as *const _, 0) };
@@ -204,6 +217,12 @@ fn set_all(p: &ProcessHandle, f: fn(&ProcessHandle, u32) -> Result<()>) -> Resul
         }
     }
     Ok(())
+}
+
+fn try_set_all(p: &ProcessHandle, f: fn(&ProcessHandle, u32) -> Result<()>) {
+    let e = set_all(p, f);
+    #[cfg(debug_assertions)]
+    handle_error(e);
 }
 
 fn is_child_of(
@@ -348,10 +367,10 @@ fn kernel_tweaks(revert: Option<Vec<String>>) -> Result<Vec<String>> {
         ("/proc/sys/kernel/sched_child_runs_first", "0"),
         ("/proc/sys/kernel/sched_autogroup_enabled", "1"),
         ("/proc/sys/kernel/sched_cfs_bandwidth_slice_us", "500"),
-        ("/sys/kernel/debug/sched/latency_ns ", "1000000"),
+        ("/sys/kernel/debug/sched/latency_ns", "1000000"),
         ("/sys/kernel/debug/sched/migration_cost_ns", "500000"),
         ("/sys/kernel/debug/sched/min_granularity_ns", "500000"),
-        ("/sys/kernel/debug/sched/wakeup_granularity_ns ", "0"),
+        ("/sys/kernel/debug/sched/wakeup_granularity_ns", "0"),
         ("/sys/kernel/debug/sched/nr_migrate", "8"),
     ];
 
@@ -486,7 +505,7 @@ fn populate_process_cache(process_cache: &Mutex<HashMap<u32, Option<ProcessHandl
             .entry(pid)
             .or_insert_with(|| get_info_for_pid(pid).ok());
     }
-    process_cache.drain_filter(|_, x| x.is_none());
+    process_cache.retain(|_, x| x.is_some());
 }
 
 fn update_all_processes_once(state: &State, process_cache: &ProcessCache) {
@@ -502,7 +521,7 @@ fn update_single_process(
 ) {
     if process.executable.is_some() {
         if should_be_realtime(process, Some(state)) || process.pid == id() {
-            handle_error(set_all(process, set_realtime));
+            try_set_all(process, set_realtime);
             if ENABLE_MLOCK {
                 handle_error(process.lock_executable());
             }
@@ -524,7 +543,7 @@ fn update_single_process(
                 process_cache,
             );
             if should_boost {
-                handle_error(set_all(process, set_boosted));
+                try_set_all(process, set_boosted);
             } else if LOW_PRIORITY_PROCESSES.iter().any(|&x| {
                 process
                     .executable
@@ -533,9 +552,9 @@ fn update_single_process(
                     .and_then(|x| x.as_os_str().to_str())
                     == Some(x)
             }) {
-                handle_error(set_all(process, set_low_priority));
+                try_set_all(process, set_low_priority);
             } else if FORCE_ASSIGN_NORMAL_SCHEDULER {
-                handle_error(set_all(process, set_normal));
+                try_set_all(process, set_normal);
             }
         }
     }

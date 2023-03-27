@@ -1,9 +1,9 @@
-use color_eyre::eyre::{ContextCompat, Result};
+use color_eyre::eyre::{eyre, ContextCompat, Result};
 use color_eyre::Report;
 use libc::{prlimit64, rlimit64, RLIMIT_MEMLOCK};
 use memmap::Mmap;
+use once_cell::sync::OnceCell;
 use std::process::{Command, Stdio};
-use std::sync::OnceLock;
 use std::{
     fs::{read_dir, read_link, read_to_string, File},
     path::PathBuf,
@@ -18,7 +18,7 @@ pub struct ProcessHandle {
     pub pid: u32,
     pub parent_pid: u32,
     pub executable: Option<PathBuf>,
-    pub executable_mmap: Arc<OnceLock<Mmap>>,
+    pub executable_mmap: Arc<OnceCell<Mmap>>,
 }
 
 const THREADED_DROP: bool = false;
@@ -70,7 +70,7 @@ impl ProcessHandle {
         }
 
         if vm_lck == 0 {
-            Command::new("gdb")
+            let success = Command::new("gdb")
                 .stdout(Stdio::inherit())
                 .arg("--pid")
                 .arg(self.pid.to_string())
@@ -81,7 +81,11 @@ impl ProcessHandle {
                 .arg("-ex")
                 .arg("quit")
                 .status()?
-                .exit_ok()?;
+                .success();
+
+            if !success {
+                return Err(eyre!("gdb failed"));
+            }
 
             println!("locked memory for {:?}", self.executable);
         }
@@ -90,7 +94,7 @@ impl ProcessHandle {
     }
 }
 
-fn drop_mmap_on_thread<T: Send + 'static>(x: &mut Arc<OnceLock<T>>) {
+fn drop_mmap_on_thread<T: Send + 'static>(x: &mut Arc<OnceCell<T>>) {
     if let Some(x) = Arc::get_mut(x) {
         if let Some(x) = x.take() {
             thread::spawn(move || {
@@ -147,6 +151,6 @@ pub fn get_info_for_pid(pid: u32) -> Result<ProcessHandle> {
         pid,
         parent_pid: ppid,
         executable: Some(exe),
-        executable_mmap: Arc::new(OnceLock::new()),
+        executable_mmap: Arc::new(OnceCell::new()),
     })
 }

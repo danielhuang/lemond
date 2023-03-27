@@ -1,6 +1,3 @@
-#![feature(once_cell)]
-#![feature(exit_status_error)]
-
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize)]
