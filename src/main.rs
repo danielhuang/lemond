@@ -33,6 +33,7 @@ const REALTIME_PROCESSES: &[&str] = &[
     "/usr/bin/pipewire",
     "/usr/bin/pipewire-pulse",
     "/usr/bin/pipewire-media-session",
+    "/usr/bin/wireplumber",
     "/usr/lib/systemd/systemd",
     "/usr/bin/pulseaudio",
     "/usr/bin/pulseeffects",
@@ -47,6 +48,7 @@ const REALTIME_PROCESSES: &[&str] = &[
     "/usr/bin/ksysguard",
     "/usr/lib/ksysguard/ksgrd_network_helper",
     "/usr/bin/ksysguardd",
+    "/usr/bin/Hyprland",
 ];
 
 const MLOCKALL_PROCESSES: &[&str] = &[
@@ -55,6 +57,10 @@ const MLOCKALL_PROCESSES: &[&str] = &[
     "/usr/bin/Xwayland",
     "/usr/bin/gnome-system-monitor",
     "/usr/lib/systemd/systemd-oomd",
+    "/usr/bin/pipewire",
+    "/usr/bin/pipewire-pulse",
+    "/usr/bin/pipewire-media-session",
+    "/usr/bin/wireplumber",
     "/usr/bin/easyeffects",
 ];
 
@@ -66,7 +72,7 @@ const SCHED_DEADLINE: i32 = 6;
 const SOCKET_PATH: &str = "/run/lemond.socket";
 
 const REALTIME_NICE: i32 = -15;
-const BOOST_NICE: i32 = -5;
+const BOOST_NICE: i32 = -7;
 const LOW_PRIORITY_NICE: i32 = 19;
 
 const REALTIME_RR: bool = true;
@@ -75,11 +81,17 @@ const USE_THREAD_IDS: bool = true;
 
 const FORCE_ASSIGN_NORMAL_SCHEDULER: bool = true;
 
+const ENABLE_NICE: bool = false;
+
 const ENABLE_SOCKET: bool = true;
-const ENABLE_MLOCK: bool = true;
-const ENABLE_GDB_MLOCK: bool = true;
+const ENABLE_MLOCK: bool = false;
+const ENABLE_GDB_MLOCK: bool = false;
 
 const ENABLE_CFS_TWEAKS: bool = true;
+
+const LEMOND_SELF_REALTIME: bool = false;
+
+static ENABLE_LATENCY_NICE: AtomicBool = AtomicBool::new(true);
 
 type ProcessCache = HashMap<u32, Option<ProcessHandle>>;
 
@@ -102,6 +114,29 @@ const SCHED_FLAG_RECLAIM: u64 = 0x02;
 const SCHED_FIXEDPOINT_SHIFT: u32 = 10;
 const SCHED_CAPACITY_SHIFT: u32 = SCHED_FIXEDPOINT_SHIFT;
 const SCHED_CAPACITY_SCALE: u32 = 1 << SCHED_CAPACITY_SHIFT;
+
+#[repr(C)]
+struct Default_sched_attr {
+    size: u32,
+
+    sched_policy: u32,
+    sched_flags: u64,
+
+    // SCHED_NORMAL, SCHED_BATCH
+    sched_nice: i32,
+
+    // SCHED_FIFO, SCHED_RR
+    sched_priority: u32,
+
+    // SCHED_DEADLINE (nsec)
+    sched_runtime: u64,
+    sched_deadline: u64,
+    sched_period: u64,
+
+    // Utilization hints
+    sched_util_min: u32,
+    sched_util_max: u32,
+}
 
 #[repr(C)]
 struct sched_attr {
@@ -141,10 +176,16 @@ fn set_nice(pid: u32, nice: i32) -> Result<()> {
 fn set_scheduler(pid: u32, policy: i32, nice: i32, prio: i32, reset_on_fork: bool) -> Result<()> {
     const NS_PER_MS: u64 = 1000 * 1000;
 
-    set_nice(pid, nice)?;
+    if ENABLE_NICE {
+        set_nice(pid, nice)?;
+    }
 
     let attr = sched_attr {
-        size: size_of::<sched_attr>() as u32,
+        size: if ENABLE_LATENCY_NICE.load(Ordering::Relaxed) {
+            size_of::<sched_attr>()
+        } else {
+            size_of::<Default_sched_attr>()
+        } as u32,
         sched_policy: policy as _,
         sched_flags: if reset_on_fork {
             SCHED_FLAG_RESET_ON_FORK | SCHED_FLAG_RECLAIM
@@ -162,10 +203,20 @@ fn set_scheduler(pid: u32, policy: i32, nice: i32, prio: i32, reset_on_fork: boo
     };
 
     let result = unsafe { syscall!(Sysno::sched_setattr, pid, &attr as *const _, 0) };
-    result.map(|_| ()).map_err(|e| {
-        Report::from(Error::from_raw_os_error(e.into_raw()))
-            .with_note(|| format!("pid={pid} policy={policy} nice={nice} prio={prio}"))
-    })
+
+    match result {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            let e = e.into_raw();
+            if e == 7 {
+                println!("disabling latency nice (not supported)");
+                ENABLE_LATENCY_NICE.store(false, Ordering::Relaxed);
+                return set_scheduler(pid, policy, nice, prio, reset_on_fork);
+            }
+            Err(Report::from(Error::from_raw_os_error(e))
+                .with_note(|| format!("pid={pid} policy={policy} nice={nice} prio={prio}")))
+        }
+    }
 }
 
 fn set_realtime(p: &ProcessHandle, pid: u32) -> Result<()> {
@@ -184,10 +235,16 @@ fn set_realtime(p: &ProcessHandle, pid: u32) -> Result<()> {
             libc::SCHED_FIFO,
             REALTIME_NICE,
             99 - i as i32,
-            !is_lemond,
+            !(is_lemond && LEMOND_SELF_REALTIME),
         )?;
     } else {
-        set_scheduler(pid, SCHED_DEADLINE, REALTIME_NICE, 0, !is_lemond)?;
+        set_scheduler(
+            pid,
+            libc::SCHED_OTHER,
+            REALTIME_NICE,
+            0,
+            !(is_lemond && LEMOND_SELF_REALTIME),
+        )?;
     }
     Ok(())
 }
@@ -252,11 +309,11 @@ fn is_equal_or_child_of(
 fn should_be_realtime(p: &ProcessHandle, state: Option<&State>) -> bool {
     if let Some(pid) = state.and_then(|x| x.client_pid) {
         if p.pid == pid {
-            return true;
+            return LEMOND_SELF_REALTIME;
         }
     }
     if p.pid == std::process::id() {
-        return true;
+        return LEMOND_SELF_REALTIME;
     }
     let exe = &p.executable;
     if let Some(exe) = exe {
@@ -289,7 +346,7 @@ fn socket_handler(
     let socket = UnixDatagram::bind(SOCKET_PATH).unwrap();
     set_permissions(SOCKET_PATH, Permissions::from_mode(0o666)).unwrap();
 
-    while running.load(Ordering::SeqCst) {
+    while running.load(Ordering::Acquire) {
         let mut buf = vec![0; 65536];
         let len = socket.recv(&mut buf).unwrap();
         let data = &buf[0..len];
@@ -322,8 +379,6 @@ fn process_message(
                     let prev_process = get_info_for_pid(prev_pid)?;
                     update_single_process(&prev_process, &state, &process_cache.lock().unwrap());
                 }
-
-                update_all_processes_once(&state, &process_cache.lock().unwrap());
             }
         }
         Message::SetClientPid { pid } => {
@@ -356,16 +411,18 @@ fn cleanup() -> Result<()> {
 
 fn kernel_tweaks(revert: Option<Vec<String>>) -> Result<Vec<String>> {
     let values = vec![
-        ("/proc/sys/vm/compaction_proactiveness", "0"),
+        // ("/proc/sys/vm/compaction_proactiveness", "0"),
         ("/proc/sys/vm/min_free_kbytes", "1048576"),
         ("/proc/sys/vm/swappiness", "10"),
+        ("/sys/kernel/mm/lru_gen/enabled", "5"),
+        ("/sys/kernel/mm/lru_gen/min_ttl_ms", "1000"),
         ("/proc/sys/vm/zone_reclaim_mode", "0"),
-        ("/sys/kernel/mm/transparent_hugepage/enabled", "never"),
-        ("/sys/kernel/mm/transparent_hugepage/shmem_enabled", "never"),
-        ("/sys/kernel/mm/transparent_hugepage/khugepaged/defrag", "0"),
+        // ("/sys/kernel/mm/transparent_hugepage/enabled", "never"),
+        // ("/sys/kernel/mm/transparent_hugepage/shmem_enabled", "never"),
+        // ("/sys/kernel/mm/transparent_hugepage/khugepaged/defrag", "0"),
         ("/proc/sys/vm/page_lock_unfairness", "1"),
         ("/proc/sys/kernel/sched_child_runs_first", "0"),
-        ("/proc/sys/kernel/sched_autogroup_enabled", "1"),
+        // ("/proc/sys/kernel/sched_autogroup_enabled", "0"),
         ("/proc/sys/kernel/sched_cfs_bandwidth_slice_us", "500"),
         ("/sys/kernel/debug/sched/latency_ns", "1000000"),
         ("/sys/kernel/debug/sched/migration_cost_ns", "500000"),
@@ -377,9 +434,20 @@ fn kernel_tweaks(revert: Option<Vec<String>>) -> Result<Vec<String>> {
     if let Some(revert) = revert {
         assert!(revert.len() == values.len());
 
-        for ((path, _), num) in values.into_iter().zip(revert) {
-            let mut file = File::create(path)?;
-            write!(&mut file, "{num}")?;
+        for ((path, _), mut num) in values.into_iter().zip(revert) {
+            if !num.is_empty() {
+                if num.contains('[') {
+                    num = num
+                        .chars()
+                        .skip_while(|&x| x != '[')
+                        .skip(1)
+                        .take_while(|&x| x != ']')
+                        .collect();
+                }
+                println!("reverting {path} back to {}", num.trim());
+                let mut file = File::create(path)?;
+                write!(&mut file, "{num}")?;
+            }
         }
 
         Ok(vec![])
@@ -387,11 +455,15 @@ fn kernel_tweaks(revert: Option<Vec<String>>) -> Result<Vec<String>> {
         let mut prev = vec![];
 
         for (path, num) in values {
-            let prev_value = read_to_string(path)?;
-            prev.push(prev_value);
-
-            let mut file = File::create(path)?;
-            write!(&mut file, "{num}")?;
+            if let Ok(mut file) = File::create(path) {
+                println!("setting {path} to {num}");
+                let prev_value = read_to_string(path)?;
+                prev.push(prev_value);
+                write!(&mut file, "{num}")?;
+            } else {
+                println!("{path} does not exist, skipping");
+                prev.push("".into());
+            }
         }
 
         Ok(prev)
@@ -432,7 +504,7 @@ fn main() {
                 signals.forever().next();
                 println!("exiting, setting processes back to normal");
 
-                running.store(false, Ordering::SeqCst);
+                running.store(false, Ordering::Release);
                 canceller.cancel().unwrap();
                 drop(state.lock().unwrap());
 
@@ -462,7 +534,7 @@ fn main() {
                 populate_process_cache(&process_cache);
             }
 
-            while running.load(Ordering::SeqCst) {
+            while running.load(Ordering::Acquire) {
                 let event = mon.wait_for_event();
 
                 let state = state.lock().unwrap();
@@ -489,7 +561,7 @@ fn main() {
             }
         });
         scope.spawn(|| {
-            while running.load(Ordering::SeqCst) {
+            while running.load(Ordering::Acquire) {
                 populate_process_cache(&process_cache);
                 update_all_processes_once(&state.lock().unwrap(), &process_cache.lock().unwrap());
                 let _ = timer.sleep(Duration::from_millis(5000));
@@ -500,12 +572,13 @@ fn main() {
 
 fn populate_process_cache(process_cache: &Mutex<HashMap<u32, Option<ProcessHandle>>>) {
     let mut process_cache = process_cache.lock().unwrap();
-    for pid in get_all_pids() {
+    let pids: HashSet<_> = get_all_pids().collect();
+    for &pid in &pids {
         process_cache
             .entry(pid)
             .or_insert_with(|| get_info_for_pid(pid).ok());
     }
-    process_cache.retain(|_, x| x.is_some());
+    process_cache.retain(|pid, handle| pids.contains(pid) && handle.is_some());
 }
 
 fn update_all_processes_once(state: &State, process_cache: &ProcessCache) {
@@ -520,7 +593,7 @@ fn update_single_process(
     process_cache: &HashMap<u32, Option<ProcessHandle>>,
 ) {
     if process.executable.is_some() {
-        if should_be_realtime(process, Some(state)) || process.pid == id() {
+        if should_be_realtime(process, Some(state)) {
             try_set_all(process, set_realtime);
             if ENABLE_MLOCK {
                 handle_error(process.lock_executable());
