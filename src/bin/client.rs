@@ -50,9 +50,9 @@ fn get_foreground_pid() -> Result<u32> {
     let foreground_pid: u32 = output
         .trim()
         .strip_prefix("('")
-        .ok_or_else(|| eyre!("ops"))?
+        .ok_or_else(|| eyre!("error {output}"))?
         .strip_suffix("',)")
-        .ok_or_else(|| eyre!("ops"))?
+        .ok_or_else(|| eyre!("error {output}"))?
         .parse()?;
 
     Ok(foreground_pid)

@@ -1,8 +1,9 @@
-use color_eyre::eyre::{eyre, ContextCompat, Result};
+use color_eyre::eyre::{eyre, Context, ContextCompat, Result};
 use color_eyre::Report;
-use libc::{prlimit64, rlimit64, RLIMIT_MEMLOCK};
+use libc::{iovec, prlimit64, rlimit64, RLIMIT_MEMLOCK, RLIM_INFINITY};
 use memmap::Mmap;
 use once_cell::sync::OnceCell;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::process::{Command, Stdio};
 use std::{
     fs::{read_dir, read_link, read_to_string, File},
@@ -12,6 +13,7 @@ use std::{
     thread,
 };
 use std::{io, ptr};
+use syscalls::{syscall, Sysno};
 
 #[derive(Debug, Clone)]
 pub struct ProcessHandle {
@@ -57,10 +59,9 @@ impl ProcessHandle {
             .trim()
             .parse()?;
 
-        // 1 TB
         let rlimit = rlimit64 {
-            rlim_cur: 1024 * 1024 * 1024 * 1024,
-            rlim_max: 1024 * 1024 * 1024 * 1024,
+            rlim_cur: RLIM_INFINITY,
+            rlim_max: RLIM_INFINITY,
         };
 
         unsafe {
@@ -153,4 +154,37 @@ pub fn get_info_for_pid(pid: u32) -> Result<ProcessHandle> {
         executable: Some(exe),
         executable_mmap: Arc::new(OnceCell::new()),
     })
+}
+
+pub fn pidfd_open(pid: i32) -> Result<OwnedFd> {
+    unsafe { syscall!(Sysno::pidfd_open, pid, 0).map(|x| OwnedFd::from_raw_fd(x as i32)) }
+        .wrap_err_with(|| format!("pid={pid}"))
+}
+
+/// # Safety
+/// see https://man7.org/linux/man-pages/man2/process_madvise.2.html
+pub unsafe fn process_madvise(
+    pidfd: &OwnedFd,
+    iovecs: &[iovec],
+    advice: i32,
+    flags: u32,
+) -> Result<usize> {
+    unsafe {
+        syscall!(
+            Sysno::process_madvise,
+            pidfd.as_raw_fd(),
+            iovecs.as_ptr(),
+            iovecs.len(),
+            advice,
+            flags
+        )
+        .wrap_err_with(|| format!("pidfd={pidfd:?}"))
+    }
+}
+
+pub fn process_mrelease(pidfd: &OwnedFd, flags: u32) -> Result<usize> {
+    unsafe {
+        syscall!(Sysno::process_mrelease, pidfd.as_raw_fd(), flags)
+            .wrap_err_with(|| format!("pidfd={pidfd:?}"))
+    }
 }
