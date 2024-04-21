@@ -6,5 +6,6 @@ pub enum Message {
     SetClientPid { pid: u32 },
 }
 
+pub mod oom;
 pub mod proc;
 pub mod procmon;

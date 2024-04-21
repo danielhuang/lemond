@@ -1,13 +1,15 @@
 use cancellable_timer::Timer;
 use color_eyre::eyre::{Context, Result};
 use color_eyre::{Help, Report};
-use lemond::proc::{get_all_pids, get_info_for_pid, pidfd_open, process_mrelease};
+use lemond::oom::{MemoryPressure, PollPressure};
+use lemond::proc::{get_all_pids, get_info_for_pid, process_mrelease};
 use lemond::procmon::ProcMon;
 use lemond::{proc::ProcessHandle, Message};
 use libc::{
     kill, mlockall, mmap, pid_t, prlimit, prlimit64, rlimit, rlimit64, setpriority, waitpid,
     MCL_CURRENT, MCL_FUTURE, RLIMIT_CPU, RLIMIT_NICE, RLIMIT_RTPRIO, RLIMIT_RTTIME, RLIM_INFINITY,
 };
+use rustix::process::{pidfd_open, pidfd_send_signal, Pid, PidfdFlags, Signal};
 use signal_hook::consts::signal::*;
 use signal_hook::iterator::Signals;
 use std::collections::HashSet;
@@ -55,7 +57,9 @@ const CRITICAL_PROCESSES: &[&str] = &[
     "/usr/bin/Hyprland",
 ];
 
-const EXCLUDE_REALTIME: &[&str] = &["/usr/bin/gnome-shell"];
+const EXCLUDE_REALTIME: &[&str] = &[
+    // "/usr/bin/gnome-shell"
+];
 
 const GDB_MLOCK_PROCESSES: &[&str] = &[
     "/usr/lib/Xorg",
@@ -80,7 +84,7 @@ const REALTIME_NICE: i32 = -15;
 const BOOST_NICE: i32 = -7;
 const LOW_PRIORITY_NICE: i32 = 19;
 
-const ENABLE_REALTIME: bool = true;
+const ENABLE_REALTIME: bool = false;
 
 const USE_THREAD_IDS: bool = true;
 
@@ -271,7 +275,7 @@ fn set_all(p: &ProcessHandle, f: fn(&ProcessHandle, u32) -> Result<()>) -> Resul
 }
 
 fn try_set_all(p: &ProcessHandle, f: fn(&ProcessHandle, u32) -> Result<()>) {
-    let e = set_all(p, f);
+    let e = set_all(p, f).with_note(|| format!("handle={p:?}"));
     #[cfg(debug_assertions)]
     handle_error(e);
 }
@@ -428,25 +432,25 @@ fn kernel_tweaks(revert: Option<Vec<String>>) -> Result<Vec<String>> {
     let values = vec![
         // ("/proc/sys/vm/compaction_proactiveness", "0"),
         ("/proc/sys/vm/min_free_kbytes", "1048576".to_string()),
-        ("/proc/sys/vm/swappiness", "15".to_string()),
+        ("/proc/sys/vm/swappiness", "60".to_string()),
         ("/sys/kernel/mm/lru_gen/enabled", "5".to_string()),
         ("/sys/kernel/mm/lru_gen/min_ttl_ms", "1000".to_string()),
-        ("/proc/sys/vm/zone_reclaim_mode", "0".to_string()),
+        // ("/proc/sys/vm/zone_reclaim_mode", "0".to_string()),
         // ("/sys/kernel/mm/transparent_hugepage/enabled", "never".to_string()),
         // ("/sys/kernel/mm/transparent_hugepage/shmem_enabled", "never".to_string()),
         // ("/sys/kernel/mm/transparent_hugepage/khugepaged/defrag", "0".to_string()),
-        ("/proc/sys/vm/page_lock_unfairness", "1".to_string()),
-        ("/proc/sys/kernel/sched_child_runs_first", "0".to_string()),
+        // ("/proc/sys/vm/page_lock_unfairness", "1".to_string()),
+        // ("/proc/sys/kernel/sched_child_runs_first", "0".to_string()),
         // ("/proc/sys/kernel/sched_autogroup_enabled", "0".to_string()),
-        (
-            "/proc/sys/kernel/sched_cfs_bandwidth_slice_us",
-            "500".to_string(),
-        ),
-        (
-            "/sys/kernel/debug/sched/migration_cost_ns",
-            "500000".to_string(),
-        ),
-        ("/sys/kernel/debug/sched/nr_migrate", "8".to_string()),
+        // (
+        //     "/proc/sys/kernel/sched_cfs_bandwidth_slice_us",
+        //     "500".to_string(),
+        // ),
+        // (
+        //     "/sys/kernel/debug/sched/migration_cost_ns",
+        //     "500000".to_string(),
+        // ),
+        // ("/sys/kernel/debug/sched/nr_migrate", "8".to_string()),
         // ("/sys/power/image_size", "0".to_string()),
         // ("/sys/power/image_size", total_memory().to_string()),
     ];
@@ -594,91 +598,99 @@ fn main() {
         });
         scope.spawn(|| {
             use std::fmt::Write;
-            let mut mem_buf = String::with_capacity(16 * 1024);
-            let mut path_buf = String::with_capacity(4096);
-            let mut file_buf = String::with_capacity(32 * 1024);
+            let mut buf = String::with_capacity(32 * 1024);
 
-            let total_memory_kb = total_memory_kb();
+            let mut mp = MemoryPressure::new();
+            let mut poll_pressure = PollPressure::default();
 
             while running.load(Ordering::Relaxed) {
-                let free_memory_kb = {
-                    mem_buf.clear();
-                    File::open("/proc/meminfo")
-                        .unwrap()
-                        .read_to_string(&mut mem_buf)
-                        .unwrap();
-                    let line = mem_buf
-                        .lines()
-                        .find(|x| x.starts_with("MemAvailable:"))
-                        .unwrap();
-                    let kb = line.split_whitespace().nth(1).unwrap();
-                    kb.parse::<u64>().unwrap()
-                };
-                // 5% left or 1GB left
-                if free_memory_kb < (total_memory_kb as u64 / 20).max(1024 * 1024) {
-                    let start = Instant::now();
-                    println!("low on memory! performing oom kill");
-                    let cache = process_cache.lock().unwrap();
-                    let oom_target = cache
-                        .iter()
-                        .filter_map(|(pid, process)| {
-                            if let Some(process) = process {
-                                if !should_be_realtime(process, None) {
-                                    return Some((pid, process));
-                                }
-                            }
-                            None
-                        })
-                        .max_by_key(|(pid, _)| {
-                            path_buf.clear();
-                            write!(&mut path_buf, "/proc/{}/status", pid).unwrap();
-                            if let Ok(mut file) = File::open(&path_buf) {
-                                file_buf.clear();
-                                file.read_to_string(&mut file_buf).unwrap();
-                                let size = file_buf
-                                    .lines()
-                                    .find_map(|x| x.strip_prefix("VmData:"))
-                                    .unwrap()
-                                    .strip_suffix("kB")
-                                    .unwrap()
-                                    .trim()
-                                    .parse::<usize>()
-                                    .unwrap();
-                                Some(size)
-                            } else {
-                                None
-                            }
-                        })
-                        .unwrap();
-                    let pid = *oom_target.0;
-                    println!(
-                        "killing target (pid={}, exe={:?}) took {:?} to find",
-                        pid,
-                        oom_target.1.executable,
-                        start.elapsed(),
-                    );
-                    drop(cache);
-                    let kill_start = Instant::now();
-                    handle_error(pidfd_open(pid as i32).and_then(|x| process_mrelease(&x, 0)));
-                    unsafe {
-                        loop {
-                            if kill(pid as i32, SIGKILL) != 0 {
-                                println!("process killed in {:?}", start.elapsed());
-                                break;
-                            }
-                            thread::sleep(Duration::from_millis(25));
-                            if kill_start.elapsed().as_secs_f64() > 1.0 {
-                                println!("kill is taking too long! bailing");
-                                break;
+                mp.read();
+
+                poll_pressure.wait();
+
+                let pressure = mp.read();
+
+                println!("memory pressure monitor event received (pressure={pressure})");
+                if pressure == 0 {
+                    continue;
+                }
+
+                let start = Instant::now();
+                println!("low on memory! performing oom kill");
+
+                let cache = process_cache.lock().unwrap();
+
+                let oom_target = cache
+                    .iter()
+                    .filter_map(|(pid, process)| {
+                        if let Some(process) = process {
+                            if !should_be_realtime(process, None) {
+                                return Some((pid, process));
                             }
                         }
-                    }
+                        None
+                    })
+                    .max_by_key(|(pid, _)| {
+                        buf.clear();
+                        write!(&mut buf, "/proc/{}/status", pid).unwrap();
+                        if let Ok(mut file) = File::open(&buf) {
+                            buf.clear();
+                            file.read_to_string(&mut buf).unwrap();
+                            let size = buf
+                                .lines()
+                                .find_map(|x| x.strip_prefix("VmData:"))
+                                .unwrap()
+                                .strip_suffix("kB")
+                                .unwrap()
+                                .trim()
+                                .parse::<usize>()
+                                .unwrap();
+                            Some(size)
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap();
+
+                let pid = *oom_target.0;
+                let Ok(pidfd) = pidfd_open(Pid::from_raw(pid as _).unwrap(), PidfdFlags::empty())
+                else {
+                    println!("failed to open pidfd (pid={pid})! does process not exist?");
                     continue;
-                } else {
-                    fs::write("/sys/power/image_size", (free_memory_kb * 1024).to_string())
-                        .unwrap();
+                };
+
+                println!(
+                    "killing target (pid={}, pidfd={pidfd:?} exe={:?}) took {:?} to find",
+                    pid,
+                    oom_target.1.executable,
+                    start.elapsed(),
+                );
+
+                drop(cache);
+
+                let kill_start = Instant::now();
+
+                handle_error(
+                    pidfd_send_signal(&pidfd, Signal::Kill)
+                        .wrap_err(format!("pid={pid} pidfd={pidfd:?}")),
+                );
+                handle_error(process_mrelease(&pidfd, 0));
+
+                loop {
+                    if pidfd_send_signal(&pidfd, Signal::Kill).is_err() {
+                        println!(
+                            "process killed in {:?} ({:?} total)",
+                            kill_start.elapsed(),
+                            start.elapsed()
+                        );
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(25));
+                    if kill_start.elapsed().as_secs_f64() > 1.0 {
+                        println!("kill is taking too long!");
+                        break;
+                    }
                 }
-                thread::sleep(Duration::from_millis((free_memory_kb / 4096).min(1000)));
             }
         });
     });

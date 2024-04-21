@@ -156,11 +156,6 @@ pub fn get_info_for_pid(pid: u32) -> Result<ProcessHandle> {
     })
 }
 
-pub fn pidfd_open(pid: i32) -> Result<OwnedFd> {
-    unsafe { syscall!(Sysno::pidfd_open, pid, 0).map(|x| OwnedFd::from_raw_fd(x as i32)) }
-        .wrap_err_with(|| format!("pid={pid}"))
-}
-
 /// # Safety
 /// see https://man7.org/linux/man-pages/man2/process_madvise.2.html
 pub unsafe fn process_madvise(
