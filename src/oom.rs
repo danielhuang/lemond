@@ -30,8 +30,8 @@ impl MemoryPressure {
             .unwrap()
             .read_to_string(&mut self.buf)
             .unwrap();
-        let full = self.buf.lines().find(|x| x.contains("full")).unwrap();
-        let total = full.split_whitespace().last().unwrap();
+        let some = self.buf.lines().find(|x| x.contains("some")).unwrap();
+        let total = some.split_whitespace().last().unwrap();
         let (_, total) = total.split_once('=').unwrap();
         let total: usize = total.parse().unwrap();
         let result = total - self.count;
@@ -52,7 +52,7 @@ impl Default for PollPressure {
             Mode::empty(),
         )
         .unwrap();
-        write(&file, b"full 500000 1000000\0").unwrap();
+        write(&file, b"some 65000 100000\0").unwrap();
         Self { file }
     }
 }

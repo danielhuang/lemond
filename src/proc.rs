@@ -1,15 +1,19 @@
 use color_eyre::eyre::{eyre, Context, ContextCompat, Result};
 use color_eyre::Report;
-use libc::{iovec, prlimit64, rlimit64, RLIMIT_MEMLOCK, RLIM_INFINITY};
+use libc::{
+    iovec, prlimit64, rlimit64, MCL_CURRENT, MCL_FUTURE, MCL_ONFAULT, RLIMIT_MEMLOCK, RLIM_INFINITY,
+};
 use memmap::Mmap;
 use once_cell::sync::OnceCell;
+use rustix::fs::{open, openat, Dir, Mode, OFlags};
+use rustix::process::{pidfd_getfd, pidfd_open, ForeignRawFd, Pid, PidfdFlags, PidfdGetfdFlags};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 use std::{
     fs::{read_dir, read_link, read_to_string, File},
     path::PathBuf,
     process::id,
-    sync::Arc,
     thread,
 };
 use std::{io, ptr};
@@ -21,6 +25,9 @@ pub struct ProcessHandle {
     pub parent_pid: u32,
     pub executable: Option<PathBuf>,
     pub executable_mmap: Arc<OnceCell<Mmap>>,
+    pub proc_dirfd: Arc<OwnedFd>,
+    pub pidfd: Arc<OwnedFd>,
+    pub fd_mmap: Arc<OnceCell<Vec<Result<Mmap, std::io::Error>>>>,
 }
 
 const THREADED_DROP: bool = false;
@@ -49,6 +56,34 @@ impl ProcessHandle {
         Ok(())
     }
 
+    pub fn all_fds(&self) -> Result<Vec<ForeignRawFd>, std::io::Error> {
+        let fds_dir = openat(&self.proc_dirfd, "fd", OFlags::DIRECTORY, Mode::empty())?;
+        let dir = Dir::new(fds_dir)?;
+        Ok(dir
+            .flat_map(|x| {
+                x.ok()
+                    .and_then(|x| x.file_name().to_str().ok().and_then(|x| x.parse().ok()))
+            })
+            .collect())
+    }
+
+    pub fn lock_fds(&self) -> Result<()> {
+        self.fd_mmap.get_or_try_init(|| {
+            println!("locking fds for {:?} ({})", self.executable, self.pid);
+            let mut mmaps = vec![];
+            for fd in self.all_fds()? {
+                let fd = pidfd_getfd(&self.pidfd, fd, PidfdGetfdFlags::empty());
+                let Ok(fd) = fd else {
+                    dbg!(&fd);
+                    continue;
+                };
+                mmaps.push(unsafe { Mmap::map(&File::from(fd.try_clone()?)) })
+            }
+            Ok(mmaps) as Result<_, std::io::Error>
+        })?;
+        Ok(())
+    }
+
     pub fn maybe_lock_all(&self) -> Result<()> {
         let vm_lck: usize = read_to_string(format!("/proc/{}/status", self.pid))?
             .lines()
@@ -70,13 +105,15 @@ impl ProcessHandle {
             }
         }
 
+        let mlock_flags = MCL_CURRENT | MCL_FUTURE | MCL_ONFAULT;
+
         if vm_lck == 0 {
             let success = Command::new("gdb")
                 .stdout(Stdio::inherit())
                 .arg("--pid")
                 .arg(self.pid.to_string())
                 .arg("-ex")
-                .arg("call (int) mlockall(3)")
+                .arg(format!("call (int) mlockall({mlock_flags})"))
                 .arg("-ex")
                 .arg("detach")
                 .arg("-ex")
@@ -134,6 +171,7 @@ fn ls_dir_ids(path: &str) -> Result<impl Iterator<Item = u32>> {
 }
 
 pub fn get_info_for_pid(pid: u32) -> Result<ProcessHandle> {
+    let dirfd = open(format!("/proc/{pid}"), OFlags::DIRECTORY, Mode::empty())?;
     let proc_status = read_to_string(format!("/proc/{pid}/status"))?;
     let ppid = proc_status
         .lines()
@@ -153,6 +191,12 @@ pub fn get_info_for_pid(pid: u32) -> Result<ProcessHandle> {
         parent_pid: ppid,
         executable: Some(exe),
         executable_mmap: Arc::new(OnceCell::new()),
+        proc_dirfd: Arc::new(dirfd),
+        pidfd: Arc::new(pidfd_open(
+            Pid::from_raw(pid as _).unwrap(),
+            PidfdFlags::empty(),
+        )?),
+        fd_mmap: Arc::new(OnceCell::new()),
     })
 }
 

@@ -94,7 +94,8 @@ const ENABLE_NICE: bool = true;
 
 const ENABLE_SOCKET: bool = true;
 const ENABLE_MLOCK: bool = true;
-const ENABLE_GDB_MLOCK: bool = false;
+const ENABLE_LOCK_FDS: bool = false;
+const ENABLE_GDB_MLOCK: bool = true;
 
 const ENABLE_KERNEL_TWEAKS: bool = true;
 
@@ -407,21 +408,19 @@ fn cleanup() -> Result<()> {
     Ok(())
 }
 
+fn extract_num(s: &str, prefix: &str) -> usize {
+    let line = s.lines().find(|x| x.starts_with(prefix)).unwrap();
+    line.split_whitespace().nth(1).unwrap().parse().unwrap()
+}
+
 fn total_memory_kb() -> usize {
     let info = read_to_string("/proc/meminfo").unwrap();
-    let line = info.lines().find(|x| x.starts_with("MemTotal:")).unwrap();
-    let kb = line.split_whitespace().nth(1).unwrap();
-    kb.parse().unwrap()
+    extract_num(&info, "MemTotal:")
 }
 
 fn available_memory_kb() -> usize {
     let info = read_to_string("/proc/meminfo").unwrap();
-    let line = info
-        .lines()
-        .find(|x| x.starts_with("MemAvailable:"))
-        .unwrap();
-    let kb = line.split_whitespace().nth(1).unwrap();
-    kb.parse().unwrap()
+    extract_num(&info, "MemAvailable:")
 }
 
 fn total_memory() -> usize {
@@ -429,12 +428,12 @@ fn total_memory() -> usize {
 }
 
 fn kernel_tweaks(revert: Option<Vec<String>>) -> Result<Vec<String>> {
-    let values = vec![
+    let values: Vec<(&'static str, String)> = vec![
         // ("/proc/sys/vm/compaction_proactiveness", "0"),
-        ("/proc/sys/vm/min_free_kbytes", "1048576".to_string()),
-        ("/proc/sys/vm/swappiness", "60".to_string()),
-        ("/sys/kernel/mm/lru_gen/enabled", "5".to_string()),
-        ("/sys/kernel/mm/lru_gen/min_ttl_ms", "1000".to_string()),
+        // ("/proc/sys/vm/min_free_kbytes", "1048576".to_string()),
+        // ("/proc/sys/vm/swappiness", "100".to_string()),
+        // ("/sys/kernel/mm/lru_gen/enabled", "5".to_string()),
+        // ("/sys/kernel/mm/lru_gen/min_ttl_ms", "1000".to_string()),
         // ("/proc/sys/vm/zone_reclaim_mode", "0".to_string()),
         // ("/sys/kernel/mm/transparent_hugepage/enabled", "never".to_string()),
         // ("/sys/kernel/mm/transparent_hugepage/shmem_enabled", "never".to_string()),
@@ -480,8 +479,8 @@ fn kernel_tweaks(revert: Option<Vec<String>>) -> Result<Vec<String>> {
 
         for (path, value) in values {
             if let Ok(mut file) = File::create(path) {
-                println!("setting {path} to {value}");
                 let prev_value = read_to_string(path)?;
+                println!("setting {path} to {value} (was {})", prev_value.trim());
                 prev.push(prev_value);
                 write!(&mut file, "{value}")?;
             } else {
@@ -603,15 +602,29 @@ fn main() {
             let mut mp = MemoryPressure::new();
             let mut poll_pressure = PollPressure::default();
 
+            let total_memory_kb = total_memory_kb();
+
             while running.load(Ordering::Relaxed) {
                 mp.read();
 
                 poll_pressure.wait();
 
                 let pressure = mp.read();
-
                 println!("memory pressure monitor event received (pressure={pressure})");
+
                 if pressure == 0 {
+                    println!("pressure not above threshold");
+                    continue;
+                }
+
+                let free_memory_kb = {
+                    buf.clear();
+                    File::open("/proc/meminfo").unwrap().read_to_string(&mut buf).unwrap();
+                    extract_num(&buf, "MemAvailable:")
+                };
+
+                if free_memory_kb > (total_memory_kb / 10) {
+                    println!("false alarm, continuing");
                     continue;
                 }
 
@@ -620,7 +633,7 @@ fn main() {
 
                 let cache = process_cache.lock().unwrap();
 
-                let oom_target = cache
+                let (&pid, handle, mem_used_kb) = cache
                     .iter()
                     .filter_map(|(pid, process)| {
                         if let Some(process) = process {
@@ -630,39 +643,30 @@ fn main() {
                         }
                         None
                     })
-                    .max_by_key(|(pid, _)| {
+                    .map(|(pid, process)| {
                         buf.clear();
                         write!(&mut buf, "/proc/{}/status", pid).unwrap();
                         if let Ok(mut file) = File::open(&buf) {
                             buf.clear();
                             file.read_to_string(&mut buf).unwrap();
-                            let size = buf
-                                .lines()
-                                .find_map(|x| x.strip_prefix("VmData:"))
-                                .unwrap()
-                                .strip_suffix("kB")
-                                .unwrap()
-                                .trim()
-                                .parse::<usize>()
-                                .unwrap();
-                            Some(size)
+                            let mem_used_kb = extract_num(&buf, "VmData:");
+                            (pid, process, Some(mem_used_kb))
                         } else {
-                            None
+                            (pid, process, None)
                         }
                     })
+                    .max_by_key(|(_, _, x)| *x)
                     .unwrap();
 
-                let pid = *oom_target.0;
-                let Ok(pidfd) = pidfd_open(Pid::from_raw(pid as _).unwrap(), PidfdFlags::empty())
-                else {
+                let Ok(pidfd) = pidfd_open(Pid::from_raw(pid as _).unwrap(), PidfdFlags::empty()) else {
                     println!("failed to open pidfd (pid={pid})! does process not exist?");
                     continue;
                 };
 
                 println!(
-                    "killing target (pid={}, pidfd={pidfd:?} exe={:?}) took {:?} to find",
+                    "killing target (pid={}, pidfd={pidfd:?} exe={:?} mem_used_kb={mem_used_kb:?}) took {:?} to find",
                     pid,
-                    oom_target.1.executable,
+                    handle.executable,
                     start.elapsed(),
                 );
 
@@ -670,23 +674,16 @@ fn main() {
 
                 let kill_start = Instant::now();
 
-                handle_error(
-                    pidfd_send_signal(&pidfd, Signal::Kill)
-                        .wrap_err(format!("pid={pid} pidfd={pidfd:?}")),
-                );
+                handle_error(pidfd_send_signal(&pidfd, Signal::Kill).wrap_err(format!("pid={pid} pidfd={pidfd:?}")));
                 handle_error(process_mrelease(&pidfd, 0));
 
                 loop {
                     if pidfd_send_signal(&pidfd, Signal::Kill).is_err() {
-                        println!(
-                            "process killed in {:?} ({:?} total)",
-                            kill_start.elapsed(),
-                            start.elapsed()
-                        );
+                        println!("process killed in {:?} ({:?} total)", kill_start.elapsed(), start.elapsed());
                         break;
                     }
-                    thread::sleep(Duration::from_millis(25));
-                    if kill_start.elapsed().as_secs_f64() > 1.0 {
+                    thread::yield_now();
+                    if kill_start.elapsed().as_secs_f64() > 10.0 {
                         println!("kill is taking too long!");
                         break;
                     }
@@ -723,6 +720,9 @@ fn update_single_process(
             try_set_all(process, set_realtime);
             if ENABLE_MLOCK {
                 handle_error(process.lock_executable());
+            }
+            if ENABLE_LOCK_FDS {
+                handle_error(process.lock_fds());
             }
             if ENABLE_GDB_MLOCK
                 && GDB_MLOCK_PROCESSES
