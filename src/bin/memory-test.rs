@@ -1,4 +1,9 @@
-use std::{hint::black_box, sync::atomic::AtomicUsize, thread, time::Instant};
+use std::{
+    hint::black_box,
+    sync::atomic::AtomicUsize,
+    thread::{self, available_parallelism},
+    time::Instant,
+};
 
 fn main() {
     let total = AtomicUsize::new(0);
@@ -6,7 +11,7 @@ fn main() {
     let amount = 128;
 
     thread::scope(|s| {
-        for _ in 0..8 {
+        for _ in 0..available_parallelism().unwrap().get() {
             s.spawn(|| {
                 let mut bufs = Vec::with_capacity(1024 * 1024);
 
@@ -17,12 +22,12 @@ fn main() {
                     let total = total.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     println!(
                         "{} GB used in {:?}",
-                        (total * amount) / 1024,
+                        (total * amount) as f64 / 1024.0,
                         start.elapsed()
                     );
                 }
             });
         }
     });
-    println!("out of time");
+    println!("reached time limit");
 }

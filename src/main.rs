@@ -6,10 +6,12 @@ use lemond::proc::{get_all_pids, get_info_for_pid, process_mrelease};
 use lemond::procmon::ProcMon;
 use lemond::{proc::ProcessHandle, Message};
 use libc::{
-    kill, mlockall, mmap, pid_t, prlimit, prlimit64, rlimit, rlimit64, setpriority, waitpid,
-    MCL_CURRENT, MCL_FUTURE, RLIMIT_CPU, RLIMIT_NICE, RLIMIT_RTPRIO, RLIMIT_RTTIME, RLIM_INFINITY,
+    kill, mlockall, mmap, pid_t, rlimit, rlimit64, setpriority, waitpid, MCL_CURRENT, MCL_FUTURE,
+    RLIMIT_CPU, RLIMIT_NICE, RLIMIT_RTPRIO, RLIMIT_RTTIME, RLIM_INFINITY,
 };
-use rustix::process::{pidfd_open, pidfd_send_signal, Pid, PidfdFlags, Signal};
+use rustix::process::{
+    pidfd_open, pidfd_send_signal, prlimit, Pid, PidfdFlags, Resource, Rlimit, Signal,
+};
 use signal_hook::consts::signal::*;
 use signal_hook::iterator::Signals;
 use std::collections::HashSet;
@@ -18,8 +20,8 @@ use std::fs::{self, read_to_string, remove_file, File};
 use std::io::{self, Read, Write};
 use std::mem::size_of;
 use std::os::unix::fs::PermissionsExt;
-use std::process::exit;
 use std::process::id;
+use std::process::{abort, exit};
 use std::ptr::null_mut;
 use std::sync::Arc;
 use std::thread;
@@ -55,10 +57,13 @@ const CRITICAL_PROCESSES: &[&str] = &[
     "/usr/lib/ksysguard/ksgrd_network_helper",
     "/usr/bin/ksysguardd",
     "/usr/bin/Hyprland",
+    "/usr/lib/mutter-x11-frames",
 ];
 
 const EXCLUDE_REALTIME: &[&str] = &[
-    // "/usr/bin/gnome-shell"
+    "/usr/bin/gnome-shell",
+    "/usr/bin/Xwayland",
+    "/usr/lib/mutter-x11-frames",
 ];
 
 const GDB_MLOCK_PROCESSES: &[&str] = &[
@@ -71,6 +76,8 @@ const GDB_MLOCK_PROCESSES: &[&str] = &[
     "/usr/bin/wireplumber",
     "/usr/bin/easyeffects",
     "/usr/bin/gnome-shell",
+    "/usr/bin/Xwayland",
+    "/usr/lib/mutter-x11-frames",
 ];
 
 const LOW_PRIORITY_PROCESSES: &[&str] = &["rustc", "cc", "c++", "gcc", "g++", "makepkg", "cc1"];
@@ -80,11 +87,11 @@ const SCHED_DEADLINE: i32 = 6;
 
 const SOCKET_PATH: &str = "/run/lemond.socket";
 
-const REALTIME_NICE: i32 = -15;
+const REALTIME_NICE: i32 = -20;
 const BOOST_NICE: i32 = -7;
 const LOW_PRIORITY_NICE: i32 = 19;
 
-const ENABLE_REALTIME: bool = false;
+const ENABLE_REALTIME: bool = true;
 
 const USE_THREAD_IDS: bool = true;
 
@@ -93,7 +100,7 @@ const FORCE_ASSIGN_NORMAL_SCHEDULER: bool = true;
 const ENABLE_NICE: bool = true;
 
 const ENABLE_SOCKET: bool = true;
-const ENABLE_MLOCK: bool = true;
+const ENABLE_EXE_MLOCK: bool = false;
 const ENABLE_LOCK_FDS: bool = false;
 const ENABLE_GDB_MLOCK: bool = true;
 
@@ -216,6 +223,7 @@ fn set_realtime(p: &ProcessHandle, pid: u32) -> Result<()> {
         };
 
         // workaround https://gitlab.freedesktop.org/drm/amd/-/issues/2861
+        // also see ~/.config/environment.d/mutter.conf
         for rlimit in [RLIMIT_RTTIME, RLIMIT_CPU, RLIMIT_RTPRIO, RLIMIT_NICE] {
             handle_error(unsafe {
                 syscall!(
@@ -408,19 +416,19 @@ fn cleanup() -> Result<()> {
     Ok(())
 }
 
-fn extract_num(s: &str, prefix: &str) -> usize {
-    let line = s.lines().find(|x| x.starts_with(prefix)).unwrap();
-    line.split_whitespace().nth(1).unwrap().parse().unwrap()
+fn extract_num(s: &str, prefix: &str) -> Option<usize> {
+    let line = s.lines().find(|x| x.starts_with(prefix))?;
+    line.split_whitespace().nth(1)?.parse().ok()
 }
 
 fn total_memory_kb() -> usize {
     let info = read_to_string("/proc/meminfo").unwrap();
-    extract_num(&info, "MemTotal:")
+    extract_num(&info, "MemTotal:").unwrap()
 }
 
 fn available_memory_kb() -> usize {
     let info = read_to_string("/proc/meminfo").unwrap();
-    extract_num(&info, "MemAvailable:")
+    extract_num(&info, "MemAvailable:").unwrap()
 }
 
 fn total_memory() -> usize {
@@ -431,7 +439,7 @@ fn kernel_tweaks(revert: Option<Vec<String>>) -> Result<Vec<String>> {
     let values: Vec<(&'static str, String)> = vec![
         // ("/proc/sys/vm/compaction_proactiveness", "0"),
         // ("/proc/sys/vm/min_free_kbytes", "1048576".to_string()),
-        // ("/proc/sys/vm/swappiness", "100".to_string()),
+        ("/proc/sys/vm/swappiness", "100".to_string()),
         // ("/sys/kernel/mm/lru_gen/enabled", "5".to_string()),
         // ("/sys/kernel/mm/lru_gen/min_ttl_ms", "1000".to_string()),
         // ("/proc/sys/vm/zone_reclaim_mode", "0".to_string()),
@@ -440,7 +448,7 @@ fn kernel_tweaks(revert: Option<Vec<String>>) -> Result<Vec<String>> {
         // ("/sys/kernel/mm/transparent_hugepage/khugepaged/defrag", "0".to_string()),
         // ("/proc/sys/vm/page_lock_unfairness", "1".to_string()),
         // ("/proc/sys/kernel/sched_child_runs_first", "0".to_string()),
-        // ("/proc/sys/kernel/sched_autogroup_enabled", "0".to_string()),
+        ("/proc/sys/kernel/sched_autogroup_enabled", "0".to_string()),
         // (
         //     "/proc/sys/kernel/sched_cfs_bandwidth_slice_us",
         //     "500".to_string(),
@@ -452,6 +460,11 @@ fn kernel_tweaks(revert: Option<Vec<String>>) -> Result<Vec<String>> {
         // ("/sys/kernel/debug/sched/nr_migrate", "8".to_string()),
         // ("/sys/power/image_size", "0".to_string()),
         // ("/sys/power/image_size", total_memory().to_string()),
+        ("/proc/sys/vm/page-cluster", "0".to_string()),
+        ("/sys/module/zswap/parameters/enabled", "N".to_string()),
+        // https://github.com/pop-os/default-settings/blob/master_jammy/etc/sysctl.d/10-pop-default-settings.conf
+        ("/proc/sys/vm/watermark_boost_factor", "0".to_string()),
+        ("/proc/sys/vm/watermark_scale_factor", "125".to_string()),
     ];
 
     if let Some(revert) = revert {
@@ -550,11 +563,11 @@ fn main() {
                 exit(0);
             }
         });
-        scope.spawn(|| {
-            if ENABLE_SOCKET {
+        if ENABLE_SOCKET {
+            scope.spawn(|| {
                 socket_handler(&state, &running, &process_cache);
-            }
-        });
+            });
+        }
         scope.spawn(|| {
             let mon = ProcMon::new();
 
@@ -620,16 +633,12 @@ fn main() {
                 let free_memory_kb = {
                     buf.clear();
                     File::open("/proc/meminfo").unwrap().read_to_string(&mut buf).unwrap();
-                    extract_num(&buf, "MemAvailable:")
+                    extract_num(&buf, "MemAvailable:").unwrap()
                 };
 
-                if free_memory_kb > (total_memory_kb / 10) {
-                    println!("false alarm, continuing");
-                    continue;
-                }
+                println!("available memory: {free_memory_kb} KB");
 
                 let start = Instant::now();
-                println!("low on memory! performing oom kill");
 
                 let cache = process_cache.lock().unwrap();
 
@@ -650,7 +659,7 @@ fn main() {
                             buf.clear();
                             file.read_to_string(&mut buf).unwrap();
                             let mem_used_kb = extract_num(&buf, "VmData:");
-                            (pid, process, Some(mem_used_kb))
+                            (pid, process, mem_used_kb)
                         } else {
                             (pid, process, None)
                         }
@@ -664,13 +673,18 @@ fn main() {
                 };
 
                 println!(
-                    "killing target (pid={}, pidfd={pidfd:?} exe={:?} mem_used_kb={mem_used_kb:?}) took {:?} to find",
+                    "found target (pid={}, pidfd={pidfd:?} exe={:?} mem_used_kb={mem_used_kb:?}) took {:?} to find",
                     pid,
                     handle.executable,
                     start.elapsed(),
                 );
 
                 drop(cache);
+
+                if free_memory_kb > (total_memory_kb / 10) {
+                    println!("enough memory left, skipping kill");
+                    continue;
+                }
 
                 let kill_start = Instant::now();
 
@@ -718,7 +732,7 @@ fn update_single_process(
     if process.executable.is_some() {
         if should_be_realtime(process, Some(state)) {
             try_set_all(process, set_realtime);
-            if ENABLE_MLOCK {
+            if ENABLE_EXE_MLOCK {
                 handle_error(process.lock_executable());
             }
             if ENABLE_LOCK_FDS {

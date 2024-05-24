@@ -9,3 +9,4 @@ pub enum Message {
 pub mod oom;
 pub mod proc;
 pub mod procmon;
+pub mod trace;
