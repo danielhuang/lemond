@@ -1,6 +1,7 @@
 use cancellable_timer::Timer;
 use color_eyre::eyre::{Context, Result};
 use color_eyre::{Help, Report};
+use lemond::extract_num;
 use lemond::oom::{MemoryPressure, PollPressure};
 use lemond::proc::{get_all_pids, get_info_for_pid, process_mrelease};
 use lemond::procmon::ProcMon;
@@ -58,6 +59,7 @@ const CRITICAL_PROCESSES: &[&str] = &[
     "/usr/bin/ksysguardd",
     "/usr/bin/Hyprland",
     "/usr/lib/mutter-x11-frames",
+    "/usr/bin/plasma-systemmonitor",
 ];
 
 const EXCLUDE_REALTIME: &[&str] = &[
@@ -78,6 +80,7 @@ const GDB_MLOCK_PROCESSES: &[&str] = &[
     "/usr/bin/gnome-shell",
     "/usr/bin/Xwayland",
     "/usr/lib/mutter-x11-frames",
+    "/usr/bin/plasma-systemmonitor",
 ];
 
 const LOW_PRIORITY_PROCESSES: &[&str] = &["rustc", "cc", "c++", "gcc", "g++", "makepkg", "cc1"];
@@ -100,13 +103,18 @@ const FORCE_ASSIGN_NORMAL_SCHEDULER: bool = true;
 const ENABLE_NICE: bool = true;
 
 const ENABLE_SOCKET: bool = true;
-const ENABLE_EXE_MLOCK: bool = false;
+const ENABLE_EXE_MLOCK: bool = true;
 const ENABLE_LOCK_FDS: bool = false;
 const ENABLE_GDB_MLOCK: bool = true;
 
 const ENABLE_KERNEL_TWEAKS: bool = true;
 
-const LEMOND_SELF_REALTIME: bool = false;
+const LEMOND_SELF_REALTIME: bool = true;
+
+use tikv_jemallocator::Jemalloc;
+
+#[global_allocator]
+static GLOBAL: Jemalloc = Jemalloc;
 
 type ProcessCache = HashMap<u32, Option<ProcessHandle>>;
 
@@ -416,11 +424,6 @@ fn cleanup() -> Result<()> {
     Ok(())
 }
 
-fn extract_num(s: &str, prefix: &str) -> Option<usize> {
-    let line = s.lines().find(|x| x.starts_with(prefix))?;
-    line.split_whitespace().nth(1)?.parse().ok()
-}
-
 fn total_memory_kb() -> usize {
     let info = read_to_string("/proc/meminfo").unwrap();
     extract_num(&info, "MemTotal:").unwrap()
@@ -438,14 +441,23 @@ fn total_memory() -> usize {
 fn kernel_tweaks(revert: Option<Vec<String>>) -> Result<Vec<String>> {
     let values: Vec<(&'static str, String)> = vec![
         // ("/proc/sys/vm/compaction_proactiveness", "0"),
-        // ("/proc/sys/vm/min_free_kbytes", "1048576".to_string()),
-        ("/proc/sys/vm/swappiness", "100".to_string()),
+        ("/proc/sys/vm/min_free_kbytes", "4194304".to_string()),
+        // ("/proc/sys/vm/swappiness", "180".to_string()),
         // ("/sys/kernel/mm/lru_gen/enabled", "5".to_string()),
         // ("/sys/kernel/mm/lru_gen/min_ttl_ms", "1000".to_string()),
         // ("/proc/sys/vm/zone_reclaim_mode", "0".to_string()),
-        // ("/sys/kernel/mm/transparent_hugepage/enabled", "never".to_string()),
-        // ("/sys/kernel/mm/transparent_hugepage/shmem_enabled", "never".to_string()),
-        // ("/sys/kernel/mm/transparent_hugepage/khugepaged/defrag", "0".to_string()),
+        (
+            "/sys/kernel/mm/transparent_hugepage/enabled",
+            "madvise".to_string(),
+        ),
+        (
+            "/sys/kernel/mm/transparent_hugepage/shmem_enabled",
+            "advise".to_string(),
+        ),
+        (
+            "/sys/kernel/mm/transparent_hugepage/defrag",
+            "never".to_string(),
+        ),
         // ("/proc/sys/vm/page_lock_unfairness", "1".to_string()),
         // ("/proc/sys/kernel/sched_child_runs_first", "0".to_string()),
         ("/proc/sys/kernel/sched_autogroup_enabled", "0".to_string()),
@@ -461,10 +473,25 @@ fn kernel_tweaks(revert: Option<Vec<String>>) -> Result<Vec<String>> {
         // ("/sys/power/image_size", "0".to_string()),
         // ("/sys/power/image_size", total_memory().to_string()),
         ("/proc/sys/vm/page-cluster", "0".to_string()),
-        ("/sys/module/zswap/parameters/enabled", "N".to_string()),
+        // ("/sys/module/zswap/parameters/enabled", "N".to_string()),
+        (
+            "/sys/module/zswap/parameters/shrinker_enabled",
+            "N".to_string(),
+        ),
+        ("/sys/module/zswap/parameters/compressor", "lz4".to_string()),
+        (
+            "/sys/module/zswap/parameters/max_pool_percent",
+            "50".to_string(),
+        ),
         // https://github.com/pop-os/default-settings/blob/master_jammy/etc/sysctl.d/10-pop-default-settings.conf
         ("/proc/sys/vm/watermark_boost_factor", "0".to_string()),
         ("/proc/sys/vm/watermark_scale_factor", "125".to_string()),
+        ("/proc/sys/vm/vfs_cache_pressure", "50".to_string()),
+        ("/proc/sys/vm/dirty_bytes", "268435456".to_string()),
+        (
+            "/proc/sys/vm/dirty_background_bytes",
+            "134217728".to_string(),
+        ),
     ];
 
     if let Some(revert) = revert {
@@ -483,6 +510,7 @@ fn kernel_tweaks(revert: Option<Vec<String>>) -> Result<Vec<String>> {
                 println!("reverting {path} back to {}", value.trim());
                 let mut file = File::create(path)?;
                 write!(&mut file, "{value}")?;
+                file.flush().unwrap();
             }
         }
 
@@ -537,6 +565,8 @@ fn main() {
         None
     };
 
+    // fs::write("/proc/self/oom_score_adj", "-1000").unwrap();
+
     println!("started");
 
     thread::scope(|scope| {
@@ -571,9 +601,7 @@ fn main() {
         scope.spawn(|| {
             let mon = ProcMon::new();
 
-            {
-                populate_process_cache(&process_cache);
-            }
+            populate_process_cache(&mut process_cache.lock().unwrap());
 
             while running.load(Ordering::Acquire) {
                 let event = mon.wait_for_event();
@@ -603,7 +631,7 @@ fn main() {
         });
         scope.spawn(|| {
             while running.load(Ordering::Acquire) {
-                populate_process_cache(&process_cache);
+                populate_process_cache(&mut process_cache.lock().unwrap());
                 update_all_processes_once(&state.lock().unwrap(), &process_cache.lock().unwrap());
                 let _ = timer.sleep(Duration::from_millis(5000));
             }
@@ -613,7 +641,7 @@ fn main() {
             let mut buf = String::with_capacity(32 * 1024);
 
             let mut mp = MemoryPressure::new();
-            let mut poll_pressure = PollPressure::default();
+            let mut poll_pressure = PollPressure::new(800000, 1000000);
 
             let total_memory_kb = total_memory_kb();
 
@@ -659,7 +687,8 @@ fn main() {
                             buf.clear();
                             file.read_to_string(&mut buf).unwrap();
                             let mem_used_kb = extract_num(&buf, "VmData:");
-                            (pid, process, mem_used_kb)
+                            let swap_used_kb = extract_num(&buf, "VmSwap:");
+                            (pid, process, mem_used_kb.map(|x| x + swap_used_kb.unwrap_or(0)))
                         } else {
                             (pid, process, None)
                         }
@@ -697,8 +726,8 @@ fn main() {
                         break;
                     }
                     thread::yield_now();
-                    if kill_start.elapsed().as_secs_f64() > 10.0 {
-                        println!("kill is taking too long!");
+                    if kill_start.elapsed().as_secs_f64() > 20.0 {
+                        println!("kill is taking too long, bailing");
                         break;
                     }
                 }
@@ -707,8 +736,7 @@ fn main() {
     });
 }
 
-fn populate_process_cache(process_cache: &Mutex<HashMap<u32, Option<ProcessHandle>>>) {
-    let mut process_cache = process_cache.lock().unwrap();
+fn populate_process_cache(process_cache: &mut HashMap<u32, Option<ProcessHandle>>) {
     let pids: HashSet<_> = get_all_pids().collect();
     for &pid in &pids {
         process_cache
@@ -716,6 +744,7 @@ fn populate_process_cache(process_cache: &Mutex<HashMap<u32, Option<ProcessHandl
             .or_insert_with(|| get_info_for_pid(pid).ok());
     }
     process_cache.retain(|pid, handle| pids.contains(pid) && handle.is_some());
+    process_cache.shrink_to_fit();
 }
 
 fn update_all_processes_once(state: &State, process_cache: &ProcessCache) {

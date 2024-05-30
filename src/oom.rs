@@ -44,15 +44,15 @@ pub struct PollPressure {
     file: OwnedFd,
 }
 
-impl Default for PollPressure {
-    fn default() -> Self {
+impl PollPressure {
+    pub fn new(threshold: usize, total: usize) -> Self {
         let file = open(
             "/proc/pressure/memory",
             OFlags::RDWR | OFlags::NONBLOCK,
             Mode::empty(),
         )
         .unwrap();
-        write(&file, b"full 850000 1000000\0").unwrap();
+        write(&file, format!("full {threshold} {total}\0").as_bytes()).unwrap();
         Self { file }
     }
 }
