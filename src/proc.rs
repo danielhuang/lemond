@@ -5,8 +5,10 @@ use libc::{
 };
 use memmap::Mmap;
 use once_cell::sync::OnceCell;
-use rustix::fs::{open, openat, Dir, Mode, OFlags};
+use rustix::fd::{AsFd, BorrowedFd};
+use rustix::fs::{open, openat, readlinkat, Dir, Mode, OFlags, RawDir};
 use rustix::process::{pidfd_getfd, pidfd_open, ForeignRawFd, Pid, PidfdFlags, PidfdGetfdFlags};
+use std::io::Read;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -23,7 +25,7 @@ use syscalls::{syscall, Sysno};
 pub struct ProcessHandle {
     pub pid: u32,
     pub parent_pid: u32,
-    pub executable: Option<PathBuf>,
+    pub executable: Option<String>,
     pub executable_mmap: Arc<OnceCell<Mmap>>,
     pub proc_dirfd: Arc<OwnedFd>,
     pub pidfd: Arc<OwnedFd>,
@@ -31,6 +33,18 @@ pub struct ProcessHandle {
 }
 
 const THREADED_DROP: bool = false;
+
+fn read_string_from_fd(fd: OwnedFd) -> Result<String> {
+    let mut file = File::from(fd);
+    let mut buf = String::new();
+    file.read_to_string(&mut buf)?;
+    Ok(buf)
+}
+
+fn read_string_from_dirfd(dirfd: BorrowedFd<'_>, path: &str) -> Result<String> {
+    let fd = openat(dirfd, path, OFlags::RDONLY, Mode::empty())?;
+    read_string_from_fd(fd)
+}
 
 impl ProcessHandle {
     pub fn parent(&self) -> Result<ProcessHandle> {
@@ -41,8 +55,9 @@ impl ProcessHandle {
         get_info_for_pid(id())
     }
 
-    pub fn thread_ids(&self) -> Result<impl Iterator<Item = u32>> {
-        ls_dir_ids(&format!("/proc/{}/task", self.pid))
+    pub fn thread_ids(&self) -> Result<Vec<u32>> {
+        let tasks = openat(&self.proc_dirfd, "task", OFlags::DIRECTORY, Mode::empty())?;
+        ls_dir_fd_ints(tasks.as_fd())
     }
 
     pub fn lock_executable(&self) -> Result<()> {
@@ -51,19 +66,23 @@ impl ProcessHandle {
                 "locking executable for {:?} ({})",
                 self.executable, self.pid
             );
-            unsafe { Ok(Mmap::map(&File::open(format!("/proc/{}/exe", self.pid))?)?) as Result<_> }
+            let fd = openat(
+                self.proc_dirfd.as_fd(),
+                "exe",
+                OFlags::RDONLY,
+                Mode::empty(),
+            )?;
+            let file = File::from(fd);
+            unsafe { Ok(Mmap::map(&file)?) as Result<_> }
         })?;
         Ok(())
     }
 
-    pub fn all_fds(&self) -> Result<Vec<ForeignRawFd>, std::io::Error> {
+    pub fn all_fds(&self) -> Result<Vec<ForeignRawFd>> {
         let fds_dir = openat(&self.proc_dirfd, "fd", OFlags::DIRECTORY, Mode::empty())?;
-        let dir = Dir::new(fds_dir)?;
-        Ok(dir
-            .flat_map(|x| {
-                x.ok()
-                    .and_then(|x| x.file_name().to_str().ok().and_then(|x| x.parse().ok()))
-            })
+        Ok(ls_dir_fd_ints(fds_dir.as_fd())?
+            .into_iter()
+            .map(|x| x as _)
             .collect())
     }
 
@@ -79,13 +98,13 @@ impl ProcessHandle {
                 };
                 mmaps.push(unsafe { Mmap::map(&File::from(fd.try_clone()?)) })
             }
-            Ok(mmaps) as Result<_, std::io::Error>
+            Ok(mmaps) as Result<_>
         })?;
         Ok(())
     }
 
     pub fn maybe_lock_all(&self) -> Result<()> {
-        let vm_lck: usize = read_to_string(format!("/proc/{}/status", self.pid))?
+        let vm_lck: usize = read_string_from_dirfd(self.proc_dirfd.as_fd(), "status")?
             .lines()
             .find_map(|x| x.strip_prefix("VmLck:"))
             .wrap_err("no VmLck")?
@@ -160,11 +179,26 @@ impl Drop for ProcessHandle {
     }
 }
 
-pub fn get_all_pids() -> impl Iterator<Item = u32> {
-    ls_dir_ids("/proc").unwrap()
+fn ls_dir_fd_ints(fd: BorrowedFd<'_>) -> Result<Vec<u32>> {
+    let mut buf = Vec::with_capacity(8192);
+    let mut iter = RawDir::new(fd, buf.spare_capacity_mut());
+    let mut result = vec![];
+    while let Some(entry) = iter.next() {
+        let entry = entry?;
+        if let Ok(name) = entry.file_name().to_str() {
+            if let Ok(num) = name.parse() {
+                result.push(num);
+            }
+        }
+    }
+    Ok(result)
 }
 
-fn ls_dir_ids(path: &str) -> Result<impl Iterator<Item = u32>> {
+pub fn get_all_pids() -> impl Iterator<Item = u32> {
+    ls_dir_ints("/proc").unwrap()
+}
+
+fn ls_dir_ints(path: &str) -> Result<impl Iterator<Item = u32>> {
     Ok(read_dir(path)?
         .filter_map(Result::ok)
         .filter_map(|x| x.file_name().to_str().and_then(|x| x.parse::<u32>().ok())))
@@ -172,24 +206,23 @@ fn ls_dir_ids(path: &str) -> Result<impl Iterator<Item = u32>> {
 
 pub fn get_info_for_pid(pid: u32) -> Result<ProcessHandle> {
     let dirfd = open(format!("/proc/{pid}"), OFlags::DIRECTORY, Mode::empty())?;
-    let proc_status = read_to_string(format!("/proc/{pid}/status"))?;
+    let proc_status = read_string_from_dirfd(dirfd.as_fd(), "status")?;
     let ppid = proc_status
         .lines()
         .find(|x| x.starts_with("PPid:"))
         .unwrap()
         .trim_start_matches("PPid:\t")
         .parse()?;
-    // dirty hack: if filename ends with ` (deleted)`, remove the ending
-    let mut exe = read_link(format!("/proc/{pid}/exe"))?;
-    if let Some(exe_str) = exe.as_os_str().to_str() {
-        if exe_str.ends_with(" (deleted)") {
-            exe = PathBuf::from(&exe_str[0..(exe_str.len() - " (deleted)".len())]);
-        }
-    }
+    let exe = readlinkat(dirfd.as_fd(), "exe", vec![])?;
     Ok(ProcessHandle {
         pid,
         parent_pid: ppid,
-        executable: Some(exe),
+        // hack: if filename ends with ` (deleted)`, remove the ending
+        executable: exe
+            .to_str()
+            .map(|exe| exe.strip_suffix(" (deleted)").unwrap_or(exe))
+            .ok()
+            .map(|x| x.to_string()),
         executable_mmap: Arc::new(OnceCell::new()),
         proc_dirfd: Arc::new(dirfd),
         pidfd: Arc::new(pidfd_open(

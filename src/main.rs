@@ -213,7 +213,6 @@ fn set_realtime(p: &ProcessHandle, pid: u32) -> Result<()> {
     let i = p
         .executable
         .as_ref()
-        .and_then(|x| x.as_os_str().to_str())
         .and_then(|x| CRITICAL_PROCESSES.iter().position(|&s| x == s))
         .unwrap_or(10);
 
@@ -222,8 +221,7 @@ fn set_realtime(p: &ProcessHandle, pid: u32) -> Result<()> {
     if ENABLE_REALTIME
         && p.executable
             .as_ref()
-            .and_then(|x| x.as_os_str().to_str())
-            .is_some_and(|x| !EXCLUDE_REALTIME.contains(&x))
+            .is_some_and(|x| !EXCLUDE_REALTIME.contains(&x.as_str()))
     {
         let limit = rlimit64 {
             rlim_cur: RLIM_INFINITY,
@@ -332,7 +330,7 @@ fn should_be_realtime(p: &ProcessHandle, state: Option<&State>) -> bool {
     }
     let exe = &p.executable;
     if let Some(exe) = exe {
-        CRITICAL_PROCESSES.iter().any(|&x| exe.to_str() == Some(x))
+        CRITICAL_PROCESSES.iter().any(|&x| exe == x)
     } else {
         false
     }
@@ -770,7 +768,7 @@ fn update_single_process(
             if ENABLE_GDB_MLOCK
                 && GDB_MLOCK_PROCESSES
                     .iter()
-                    .any(|&x| process.executable.as_ref().and_then(|x| x.to_str()) == Some(x))
+                    .any(|&x| process.executable.as_deref() == Some(x))
             {
                 handle_error(process.maybe_lock_all());
             }
@@ -790,8 +788,7 @@ fn update_single_process(
                 process
                     .executable
                     .as_ref()
-                    .and_then(|x| x.components().last())
-                    .and_then(|x| x.as_os_str().to_str())
+                    .and_then(|x| x.split('/').last())
                     == Some(x)
             }) {
                 try_set_all(process, set_low_priority);

@@ -26,7 +26,7 @@ fn main() {
         println!(
             "{} {} mem={} swap={} total={}",
             handle.pid,
-            handle.executable.as_ref().unwrap().to_string_lossy(),
+            handle.executable.as_ref().unwrap(),
             mem_usage.0,
             mem_usage.1,
             mem_usage.0 + mem_usage.1,
