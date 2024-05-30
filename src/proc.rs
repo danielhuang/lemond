@@ -29,7 +29,7 @@ pub struct ProcessHandle {
     pub executable_mmap: Arc<OnceCell<Mmap>>,
     pub proc_dirfd: Arc<OwnedFd>,
     pub pidfd: Arc<OwnedFd>,
-    pub fd_mmap: Arc<OnceCell<Vec<Result<Mmap, std::io::Error>>>>,
+    pub fd_mmaps: Arc<OnceCell<Vec<Result<Mmap, std::io::Error>>>>,
 }
 
 const THREADED_DROP: bool = false;
@@ -87,7 +87,7 @@ impl ProcessHandle {
     }
 
     pub fn lock_fds(&self) -> Result<()> {
-        self.fd_mmap.get_or_try_init(|| {
+        self.fd_mmaps.get_or_try_init(|| {
             println!("locking fds for {:?} ({})", self.executable, self.pid);
             let mut mmaps = vec![];
             for fd in self.all_fds()? {
@@ -96,7 +96,7 @@ impl ProcessHandle {
                     dbg!(&fd);
                     continue;
                 };
-                mmaps.push(unsafe { Mmap::map(&File::from(fd.try_clone()?)) })
+                mmaps.push(unsafe { Mmap::map(&File::from(fd)) })
             }
             Ok(mmaps) as Result<_>
         })?;
@@ -229,7 +229,7 @@ pub fn get_info_for_pid(pid: u32) -> Result<ProcessHandle> {
             Pid::from_raw(pid as _).unwrap(),
             PidfdFlags::empty(),
         )?),
-        fd_mmap: Arc::new(OnceCell::new()),
+        fd_mmaps: Arc::new(OnceCell::new()),
     })
 }
 
