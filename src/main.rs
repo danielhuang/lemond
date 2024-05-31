@@ -10,6 +10,8 @@ use libc::{
     kill, mlockall, mmap, pid_t, rlimit, rlimit64, setpriority, waitpid, MCL_CURRENT, MCL_FUTURE,
     RLIMIT_CPU, RLIMIT_NICE, RLIMIT_RTPRIO, RLIMIT_RTTIME, RLIM_INFINITY,
 };
+use rustix::fd::AsFd;
+use rustix::fs::{openat, Mode, OFlags};
 use rustix::process::{
     pidfd_open, pidfd_send_signal, prlimit, Pid, PidfdFlags, Resource, Rlimit, Signal,
 };
@@ -635,7 +637,6 @@ fn main() {
             }
         });
         scope.spawn(|| {
-            use std::fmt::Write;
             let mut buf = String::with_capacity(32 * 1024);
 
             let mut mp = MemoryPressure::new();
@@ -679,9 +680,9 @@ fn main() {
                         None
                     })
                     .map(|(pid, process)| {
-                        buf.clear();
-                        write!(&mut buf, "/proc/{}/status", pid).unwrap();
-                        if let Ok(mut file) = File::open(&buf) {
+                        if let Ok(mut file) =
+                            openat(process.proc_dirfd.as_fd(), "status", OFlags::RDONLY, Mode::empty()).map(File::from)
+                        {
                             buf.clear();
                             file.read_to_string(&mut buf).unwrap();
                             let mem_used_kb = extract_num(&buf, "VmData:");
@@ -694,7 +695,7 @@ fn main() {
                     .max_by_key(|(_, _, x)| *x)
                     .unwrap();
 
-                let Ok(pidfd) = pidfd_open(Pid::from_raw(pid as _).unwrap(), PidfdFlags::empty()) else {
+                let Ok(pidfd) = handle.pidfd.try_clone() else {
                     println!("failed to open pidfd (pid={pid})! does process not exist?");
                     continue;
                 };
@@ -770,7 +771,7 @@ fn update_single_process(
                     .iter()
                     .any(|&x| process.executable.as_deref() == Some(x))
             {
-                handle_error(process.maybe_lock_all());
+                handle_error(process.gdb_lock_all());
             }
         } else if is_child_of(
             process,

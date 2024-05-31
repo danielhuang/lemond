@@ -21,6 +21,8 @@ use std::{
 use std::{io, ptr};
 use syscalls::{syscall, Sysno};
 
+use crate::extract_num;
+
 #[derive(Debug, Clone)]
 pub struct ProcessHandle {
     pub pid: u32,
@@ -103,7 +105,7 @@ impl ProcessHandle {
         Ok(())
     }
 
-    pub fn maybe_lock_all(&self) -> Result<()> {
+    pub fn gdb_lock_all(&self) -> Result<()> {
         let vm_lck: usize = read_string_from_dirfd(self.proc_dirfd.as_fd(), "status")?
             .lines()
             .find_map(|x| x.strip_prefix("VmLck:"))
@@ -149,6 +151,11 @@ impl ProcessHandle {
 
         Ok(())
     }
+
+    pub fn status(&self) -> Result<ProcStatus> {
+        let proc_status = read_string_from_dirfd(self.proc_dirfd.as_fd(), "status")?;
+        Ok(ProcStatus(proc_status))
+    }
 }
 
 fn drop_mmap_on_thread<T: Send + 'static>(x: &mut Arc<OnceCell<T>>) {
@@ -176,6 +183,14 @@ impl Drop for ProcessHandle {
         if THREADED_DROP {
             drop_mmap_on_thread(&mut self.executable_mmap);
         }
+    }
+}
+
+pub struct ProcStatus(pub String);
+
+impl ProcStatus {
+    pub fn extract_num(&self, prefix: &str) -> Option<usize> {
+        extract_num(&self.0, prefix)
     }
 }
 
