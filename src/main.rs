@@ -26,6 +26,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::process::id;
 use std::process::{abort, exit};
 use std::ptr::null_mut;
+use std::sync::mpsc::sync_channel;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -440,9 +441,9 @@ fn total_memory() -> usize {
 
 fn kernel_tweaks(revert: Option<Vec<String>>) -> Result<Vec<String>> {
     let values: Vec<(&'static str, String)> = vec![
-        // ("/proc/sys/vm/compaction_proactiveness", "0"),
+        // ("/proc/sys/vm/compaction_proactiveness", "0".to_string()),
         ("/proc/sys/vm/min_free_kbytes", "4194304".to_string()),
-        // ("/proc/sys/vm/swappiness", "180".to_string()),
+        //("/proc/sys/vm/swappiness", "0".to_string()),
         // ("/sys/kernel/mm/lru_gen/enabled", "5".to_string()),
         // ("/sys/kernel/mm/lru_gen/min_ttl_ms", "1000".to_string()),
         // ("/proc/sys/vm/zone_reclaim_mode", "0".to_string()),
@@ -479,10 +480,10 @@ fn kernel_tweaks(revert: Option<Vec<String>>) -> Result<Vec<String>> {
             "N".to_string(),
         ),
         ("/sys/module/zswap/parameters/compressor", "lz4".to_string()),
-        (
-            "/sys/module/zswap/parameters/max_pool_percent",
-            "50".to_string(),
-        ),
+        // (
+        //     "/sys/module/zswap/parameters/max_pool_percent",
+        //     "50".to_string(),
+        // ),
         // https://github.com/pop-os/default-settings/blob/master_jammy/etc/sysctl.d/10-pop-default-settings.conf
         ("/proc/sys/vm/watermark_boost_factor", "0".to_string()),
         ("/proc/sys/vm/watermark_scale_factor", "125".to_string()),
@@ -565,7 +566,7 @@ fn main() {
         None
     };
 
-    // fs::write("/proc/self/oom_score_adj", "-1000").unwrap();
+    fs::write("/proc/self/oom_score_adj", "-1000").unwrap();
 
     println!("started");
 

@@ -2,6 +2,6 @@
 
 perf*
 
-log.txt
 *.heap
 *.pdf
+*.txt
