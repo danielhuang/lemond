@@ -270,7 +270,7 @@ pub unsafe fn process_madvise(
     }
 }
 
-pub fn process_mrelease(pidfd: &OwnedFd, flags: u32) -> Result<usize> {
+pub fn process_mrelease(pidfd: BorrowedFd, flags: u32) -> Result<usize> {
     unsafe {
         syscall!(Sysno::process_mrelease, pidfd.as_raw_fd(), flags)
             .wrap_err_with(|| format!("pidfd={pidfd:?}"))

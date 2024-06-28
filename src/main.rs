@@ -639,7 +639,7 @@ fn main() {
                 let kill_start = Instant::now();
 
                 handle_error(pidfd_send_signal(&pidfd, Signal::Kill).wrap_err(format!("pid={pid} pidfd={pidfd:?}")));
-                handle_error(process_mrelease(&pidfd, 0));
+                handle_error(process_mrelease(pidfd.as_fd(), 0));
 
                 loop {
                     if pidfd_send_signal(&pidfd, Signal::Kill).is_err() {
