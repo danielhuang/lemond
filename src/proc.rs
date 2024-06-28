@@ -50,11 +50,11 @@ fn read_string_from_dirfd(dirfd: BorrowedFd<'_>, path: &str) -> Result<String> {
 
 impl ProcessHandle {
     pub fn parent(&self) -> Result<ProcessHandle> {
-        get_info_for_pid(self.parent_pid)
+        Self::from_pid(self.parent_pid)
     }
 
     pub fn current() -> Result<ProcessHandle> {
-        get_info_for_pid(id())
+        Self::from_pid(id())
     }
 
     pub fn thread_ids(&self) -> Result<Vec<u32>> {
@@ -156,6 +156,35 @@ impl ProcessHandle {
         let proc_status = read_string_from_dirfd(self.proc_dirfd.as_fd(), "status")?;
         Ok(ProcStatus(proc_status))
     }
+
+    pub fn from_pid(pid: u32) -> Result<Self> {
+        let dirfd = open(format!("/proc/{pid}"), OFlags::DIRECTORY, Mode::empty())?;
+        let proc_status = read_string_from_dirfd(dirfd.as_fd(), "status")?;
+        let ppid = proc_status
+            .lines()
+            .find(|x| x.starts_with("PPid:"))
+            .unwrap()
+            .trim_start_matches("PPid:\t")
+            .parse()?;
+        let exe = readlinkat(dirfd.as_fd(), "exe", vec![])?;
+        Ok(Self {
+            pid,
+            parent_pid: ppid,
+            // hack: if filename ends with ` (deleted)`, remove the ending
+            executable: exe
+                .to_str()
+                .map(|exe| exe.strip_suffix(" (deleted)").unwrap_or(exe))
+                .ok()
+                .map(|x| x.to_string()),
+            executable_mmap: Arc::new(OnceCell::new()),
+            proc_dirfd: Arc::new(dirfd),
+            pidfd: Arc::new(pidfd_open(
+                Pid::from_raw(pid as _).unwrap(),
+                PidfdFlags::empty(),
+            )?),
+            fd_mmaps: Arc::new(OnceCell::new()),
+        })
+    }
 }
 
 fn drop_mmap_on_thread<T: Send + 'static>(x: &mut Arc<OnceCell<T>>) {
@@ -186,6 +215,7 @@ impl Drop for ProcessHandle {
     }
 }
 
+#[derive(Debug)]
 pub struct ProcStatus(pub String);
 
 impl ProcStatus {
@@ -217,35 +247,6 @@ fn ls_dir_ints(path: &str) -> Result<impl Iterator<Item = u32>> {
     Ok(read_dir(path)?
         .filter_map(Result::ok)
         .filter_map(|x| x.file_name().to_str().and_then(|x| x.parse::<u32>().ok())))
-}
-
-pub fn get_info_for_pid(pid: u32) -> Result<ProcessHandle> {
-    let dirfd = open(format!("/proc/{pid}"), OFlags::DIRECTORY, Mode::empty())?;
-    let proc_status = read_string_from_dirfd(dirfd.as_fd(), "status")?;
-    let ppid = proc_status
-        .lines()
-        .find(|x| x.starts_with("PPid:"))
-        .unwrap()
-        .trim_start_matches("PPid:\t")
-        .parse()?;
-    let exe = readlinkat(dirfd.as_fd(), "exe", vec![])?;
-    Ok(ProcessHandle {
-        pid,
-        parent_pid: ppid,
-        // hack: if filename ends with ` (deleted)`, remove the ending
-        executable: exe
-            .to_str()
-            .map(|exe| exe.strip_suffix(" (deleted)").unwrap_or(exe))
-            .ok()
-            .map(|x| x.to_string()),
-        executable_mmap: Arc::new(OnceCell::new()),
-        proc_dirfd: Arc::new(dirfd),
-        pidfd: Arc::new(pidfd_open(
-            Pid::from_raw(pid as _).unwrap(),
-            PidfdFlags::empty(),
-        )?),
-        fd_mmaps: Arc::new(OnceCell::new()),
-    })
 }
 
 /// # Safety

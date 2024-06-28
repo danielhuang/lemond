@@ -1,9 +1,15 @@
 use cancellable_timer::Timer;
 use color_eyre::eyre::{Context, Result};
 use color_eyre::{Help, Report};
+use lemond::config::{
+    BOOST_NICE, CRITICAL_PROCESSES, ENABLE_EXE_MLOCK, ENABLE_GDB_MLOCK, ENABLE_KERNEL_TWEAKS,
+    ENABLE_LOCK_FDS, ENABLE_NICE, ENABLE_REALTIME, ENABLE_SOCKET, EXCLUDE_REALTIME,
+    FORCE_ASSIGN_NORMAL_SCHEDULER, GDB_MLOCK_PROCESSES, LEMOND_SELF_REALTIME, LOW_PRIORITY_NICE,
+    LOW_PRIORITY_PROCESSES, REALTIME_NICE, SCHED_IDLEPRIO, SOCKET_PATH, USE_THREAD_IDS,
+};
 use lemond::extract_num;
 use lemond::oom::{MemoryPressure, PollPressure};
-use lemond::proc::{get_all_pids, get_info_for_pid, process_mrelease};
+use lemond::proc::{get_all_pids, process_mrelease};
 use lemond::procmon::ProcMon;
 use lemond::{proc::ProcessHandle, Message};
 use libc::{
@@ -40,79 +46,6 @@ use std::{
 };
 use std::{io::Error, os::unix::net::UnixDatagram};
 use syscalls::{syscall, Sysno};
-
-const CRITICAL_PROCESSES: &[&str] = &[
-    "/usr/bin/pipewire",
-    "/usr/bin/pipewire-pulse",
-    "/usr/bin/pipewire-media-session",
-    "/usr/bin/wireplumber",
-    "/usr/lib/systemd/systemd",
-    "/usr/bin/pulseaudio",
-    "/usr/bin/pulseeffects",
-    "/usr/bin/easyeffects",
-    "/usr/bin/kwin_wayland",
-    "/usr/bin/gnome-shell",
-    "/usr/bin/Xwayland",
-    "/usr/lib/Xorg",
-    "/usr/bin/gnome-system-monitor",
-    "/usr/bin/i3lock",
-    "/usr/lib/systemd/systemd-oomd",
-    "/usr/bin/ksysguard",
-    "/usr/lib/ksysguard/ksgrd_network_helper",
-    "/usr/bin/ksysguardd",
-    "/usr/bin/Hyprland",
-    "/usr/lib/mutter-x11-frames",
-    "/usr/bin/plasma-systemmonitor",
-];
-
-const EXCLUDE_REALTIME: &[&str] = &[
-    "/usr/bin/gnome-shell",
-    "/usr/bin/Xwayland",
-    "/usr/lib/mutter-x11-frames",
-];
-
-const GDB_MLOCK_PROCESSES: &[&str] = &[
-    "/usr/lib/Xorg",
-    "/usr/bin/gnome-system-monitor",
-    "/usr/lib/systemd/systemd-oomd",
-    "/usr/bin/pipewire",
-    "/usr/bin/pipewire-pulse",
-    "/usr/bin/pipewire-media-session",
-    "/usr/bin/wireplumber",
-    "/usr/bin/easyeffects",
-    "/usr/bin/gnome-shell",
-    "/usr/bin/Xwayland",
-    "/usr/lib/mutter-x11-frames",
-    "/usr/bin/plasma-systemmonitor",
-];
-
-const LOW_PRIORITY_PROCESSES: &[&str] = &["rustc", "cc", "c++", "gcc", "g++", "makepkg", "cc1"];
-
-const SCHED_IDLEPRIO: i32 = 5;
-const SCHED_DEADLINE: i32 = 6;
-
-const SOCKET_PATH: &str = "/run/lemond.socket";
-
-const REALTIME_NICE: i32 = -20;
-const BOOST_NICE: i32 = -7;
-const LOW_PRIORITY_NICE: i32 = 19;
-
-const ENABLE_REALTIME: bool = true;
-
-const USE_THREAD_IDS: bool = true;
-
-const FORCE_ASSIGN_NORMAL_SCHEDULER: bool = true;
-
-const ENABLE_NICE: bool = true;
-
-const ENABLE_SOCKET: bool = true;
-const ENABLE_EXE_MLOCK: bool = true;
-const ENABLE_LOCK_FDS: bool = false;
-const ENABLE_GDB_MLOCK: bool = true;
-
-const ENABLE_KERNEL_TWEAKS: bool = true;
-
-const LEMOND_SELF_REALTIME: bool = true;
 
 use tikv_jemallocator::Jemalloc;
 
@@ -322,7 +255,7 @@ fn is_equal_or_child_of(
     predicate(x) || is_child_of(x, predicate, process_cache)
 }
 
-fn should_be_realtime(p: &ProcessHandle, state: Option<&State>) -> bool {
+fn is_critical(p: &ProcessHandle, state: Option<&State>) -> bool {
     if let Some(pid) = state.and_then(|x| x.client_pid) {
         if p.pid == pid {
             return LEMOND_SELF_REALTIME;
@@ -387,12 +320,12 @@ fn process_message(
 
             if pid != prev_pid {
                 if let Some(pid) = pid {
-                    let process = get_info_for_pid(pid)?;
+                    let process = ProcessHandle::from_pid(pid)?;
                     update_single_process(&process, &state, &process_cache.lock().unwrap());
                 }
 
                 if let Some(prev_pid) = prev_pid {
-                    let prev_process = get_info_for_pid(prev_pid)?;
+                    let prev_process = ProcessHandle::from_pid(prev_pid)?;
                     update_single_process(&prev_process, &state, &process_cache.lock().unwrap());
                 }
             }
@@ -405,7 +338,7 @@ fn process_message(
 }
 
 fn cleanup() -> Result<()> {
-    let all_processes: Vec<_> = get_all_pids().map(get_info_for_pid).collect();
+    let all_processes: Vec<_> = get_all_pids().map(ProcessHandle::from_pid).collect();
     let process_cache = all_processes
         .iter()
         .filter_map(|x| x.as_ref().ok())
@@ -413,11 +346,7 @@ fn cleanup() -> Result<()> {
         .collect();
     for process in all_processes.into_iter().flatten() {
         if process.executable.is_some()
-            && is_equal_or_child_of(
-                &process,
-                |parent| should_be_realtime(parent, None),
-                &process_cache,
-            )
+            && is_equal_or_child_of(&process, |parent| is_critical(parent, None), &process_cache)
         {
             set_all(&process, set_normal)?;
         }
@@ -615,7 +544,7 @@ fn main() {
                     Some(lemond::procmon::EventType::Exec) => {
                         if event.pid == event.tgid {
                             let new_pid = event.pid;
-                            let process_info = get_info_for_pid(new_pid).ok();
+                            let process_info = ProcessHandle::from_pid(new_pid).ok();
                             process_cache.insert(new_pid, process_info.clone());
                             if let Some(process) = process_info {
                                 update_single_process(&process, &state, &process_cache);
@@ -672,18 +601,9 @@ fn main() {
 
                 let (&pid, handle, mem_used_kb) = cache
                     .iter()
-                    .filter_map(|(pid, process)| {
-                        if let Some(process) = process {
-                            if !should_be_realtime(process, None) {
-                                return Some((pid, process));
-                            }
-                        }
-                        None
-                    })
+                    .filter_map(|(pid, process)| process.as_ref().map(|process| (pid, process)))
                     .map(|(pid, process)| {
-                        if let Ok(mut file) =
-                            openat(process.proc_dirfd.as_fd(), "status", OFlags::RDONLY, Mode::empty()).map(File::from)
-                        {
+                        if let Ok(mut file) = openat(process.proc_dirfd.as_fd(), "status", OFlags::RDONLY, Mode::empty()).map(File::from) {
                             buf.clear();
                             file.read_to_string(&mut buf).unwrap();
                             let mem_used_kb = extract_num(&buf, "VmData:");
@@ -702,9 +622,10 @@ fn main() {
                 };
 
                 println!(
-                    "found target (pid={}, pidfd={pidfd:?} exe={:?} mem_used_kb={mem_used_kb:?}) took {:?} to find",
+                    "found target (pid={}, pidfd={pidfd:?} exe={:?} mem_used_kb={mem_used_kb:?} critical={}) took {:?} to find",
                     pid,
                     handle.executable,
+                    is_critical(handle, None),
                     start.elapsed(),
                 );
 
@@ -741,7 +662,7 @@ fn populate_process_cache(process_cache: &mut HashMap<u32, Option<ProcessHandle>
     for &pid in &pids {
         process_cache
             .entry(pid)
-            .or_insert_with(|| get_info_for_pid(pid).ok());
+            .or_insert_with(|| ProcessHandle::from_pid(pid).ok());
     }
     process_cache.retain(|pid, handle| pids.contains(pid) && handle.is_some());
     process_cache.shrink_to_fit();
@@ -759,7 +680,7 @@ fn update_single_process(
     process_cache: &HashMap<u32, Option<ProcessHandle>>,
 ) {
     if process.executable.is_some() {
-        if should_be_realtime(process, Some(state)) {
+        if is_critical(process, Some(state)) {
             try_set_all(process, set_realtime);
             if ENABLE_EXE_MLOCK {
                 handle_error(process.lock_executable());
@@ -776,7 +697,7 @@ fn update_single_process(
             }
         } else if is_child_of(
             process,
-            |parent| should_be_realtime(parent, Some(state)),
+            |parent| is_critical(parent, Some(state)),
             process_cache,
         ) {
             let should_boost = is_equal_or_child_of(

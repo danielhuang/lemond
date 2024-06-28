@@ -11,6 +11,7 @@ pub fn extract_num(s: &str, prefix: &str) -> Option<usize> {
     line.split_whitespace().nth(1)?.parse().ok()
 }
 
+pub mod config;
 pub mod oom;
 pub mod proc;
 pub mod procmon;

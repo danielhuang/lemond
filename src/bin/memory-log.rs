@@ -2,7 +2,7 @@ use chrono::Local;
 use color_eyre::eyre::Result;
 use lemond::{
     extract_num,
-    proc::{get_all_pids, get_info_for_pid},
+    proc::{get_all_pids, ProcessHandle},
 };
 use std::{cmp::Reverse, fs::read_to_string, thread, time::Duration};
 
@@ -15,7 +15,7 @@ fn main() {
     loop {
         println!("{}", Local::now().to_rfc3339());
         let mut pids: Vec<_> = get_all_pids()
-            .map(get_info_for_pid)
+            .map(ProcessHandle::from_pid)
             .filter_map(|x| x.ok())
             .map(|x| (read_mem(x.pid), x))
             .collect();
