@@ -63,10 +63,10 @@ pub const FORCE_ASSIGN_NORMAL_SCHEDULER: bool = true;
 pub const ENABLE_NICE: bool = true;
 
 pub const ENABLE_SOCKET: bool = true;
-pub const ENABLE_EXE_MLOCK: bool = true;
+pub const ENABLE_EXE_MLOCK: bool = false;
 pub const ENABLE_LOCK_FDS: bool = false;
 pub const ENABLE_GDB_MLOCK: bool = true;
 
 pub const ENABLE_KERNEL_TWEAKS: bool = true;
 
-pub const LEMOND_SELF_REALTIME: bool = true;
+pub const LEMOND_SELF_REALTIME: bool = false;

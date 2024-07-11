@@ -12,30 +12,53 @@ use rustix::{
 
 #[derive(Default)]
 pub struct MemoryPressure {
-    count: usize,
+    some_total_prev: usize,
+    full_total_prev: usize,
     buf: String,
+}
+
+#[derive(Clone, Copy, PartialEq, PartialOrd, Ord, Eq)]
+pub struct MemoryPressureDelta {
+    pub some: usize,
+    pub full: usize,
 }
 
 impl MemoryPressure {
     pub fn new() -> Self {
-        let mut x = Self::default();
+        let mut x = Self {
+            some_total_prev: 0,
+            full_total_prev: 0,
+            buf: String::new(),
+        };
         x.buf.reserve(1024);
         x.read();
         x
     }
 
-    pub fn read(&mut self) -> usize {
+    pub fn read(&mut self) -> MemoryPressureDelta {
         self.buf.clear();
         File::open("/proc/pressure/memory")
             .unwrap()
             .read_to_string(&mut self.buf)
             .unwrap();
-        let full = self.buf.lines().find(|x| x.contains("full")).unwrap();
-        let total = full.split_whitespace().last().unwrap();
-        let (_, total) = total.split_once('=').unwrap();
-        let total: usize = total.parse().unwrap();
-        let result = total - self.count;
-        self.count = total;
+
+        fn get(buf: &str, key: &str) -> usize {
+            let line = buf.lines().find(|x| x.contains(key)).unwrap();
+            let (_, total) = line.rsplit_once("=").unwrap();
+            total.parse().unwrap()
+        }
+
+        let some_total = get(&self.buf, "some");
+        let full_total = get(&self.buf, "full");
+
+        let result = MemoryPressureDelta {
+            some: some_total - self.some_total_prev,
+            full: full_total - self.full_total_prev,
+        };
+
+        self.some_total_prev = some_total;
+        self.full_total_prev = full_total;
+
         result
     }
 }
@@ -45,15 +68,23 @@ pub struct PollPressure {
 }
 
 impl PollPressure {
-    pub fn new(threshold: usize, total: usize) -> Self {
+    fn new(threshold: usize, total: usize, key: &str) -> Self {
         let file = open(
             "/proc/pressure/memory",
             OFlags::RDWR | OFlags::NONBLOCK,
             Mode::empty(),
         )
         .unwrap();
-        write(&file, format!("full {threshold} {total}\0").as_bytes()).unwrap();
+        write(&file, format!("{key} {threshold} {total}\0").as_bytes()).unwrap();
         Self { file }
+    }
+
+    pub fn some(threshold: usize, total: usize) -> Self {
+        Self::new(threshold, total, "some")
+    }
+
+    pub fn full(threshold: usize, total: usize) -> Self {
+        Self::new(threshold, total, "full")
     }
 }
 

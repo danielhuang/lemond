@@ -18,6 +18,7 @@ use libc::{
 };
 use rustix::fd::AsFd;
 use rustix::fs::{openat, Mode, OFlags};
+use rustix::path::Arg;
 use rustix::process::{
     pidfd_open, pidfd_send_signal, prlimit, Pid, PidfdFlags, Resource, Rlimit, Signal,
 };
@@ -25,7 +26,7 @@ use signal_hook::consts::signal::*;
 use signal_hook::iterator::Signals;
 use std::collections::HashSet;
 use std::env::set_var;
-use std::fs::{self, read_to_string, remove_file, File};
+use std::fs::{self, read_dir, read_to_string, remove_file, write, File};
 use std::io::{self, Read, Write};
 use std::mem::size_of;
 use std::os::unix::fs::PermissionsExt;
@@ -371,23 +372,22 @@ fn total_memory() -> usize {
 fn kernel_tweaks(revert: Option<Vec<String>>) -> Result<Vec<String>> {
     let values: Vec<(&'static str, String)> = vec![
         // ("/proc/sys/vm/compaction_proactiveness", "0".to_string()),
-        ("/proc/sys/vm/min_free_kbytes", "4194304".to_string()),
-        //("/proc/sys/vm/swappiness", "0".to_string()),
+        // ("/proc/sys/vm/min_free_kbytes", "4194304".to_string()),
         // ("/sys/kernel/mm/lru_gen/enabled", "5".to_string()),
-        // ("/sys/kernel/mm/lru_gen/min_ttl_ms", "1000".to_string()),
+        // ("/sys/kernel/mm/lru_gen/min_ttl_ms", "0".to_string()),
         // ("/proc/sys/vm/zone_reclaim_mode", "0".to_string()),
-        (
-            "/sys/kernel/mm/transparent_hugepage/enabled",
-            "madvise".to_string(),
-        ),
-        (
-            "/sys/kernel/mm/transparent_hugepage/shmem_enabled",
-            "advise".to_string(),
-        ),
-        (
-            "/sys/kernel/mm/transparent_hugepage/defrag",
-            "never".to_string(),
-        ),
+        // (
+        //     "/sys/kernel/mm/transparent_hugepage/enabled",
+        //     "madvise".to_string(),
+        // ),
+        // (
+        //     "/sys/kernel/mm/transparent_hugepage/shmem_enabled",
+        //     "advise".to_string(),
+        // ),
+        // (
+        //     "/sys/kernel/mm/transparent_hugepage/defrag",
+        //     "never".to_string(),
+        // ),
         // ("/proc/sys/vm/page_lock_unfairness", "1".to_string()),
         // ("/proc/sys/kernel/sched_child_runs_first", "0".to_string()),
         ("/proc/sys/kernel/sched_autogroup_enabled", "0".to_string()),
@@ -402,13 +402,13 @@ fn kernel_tweaks(revert: Option<Vec<String>>) -> Result<Vec<String>> {
         // ("/sys/kernel/debug/sched/nr_migrate", "8".to_string()),
         // ("/sys/power/image_size", "0".to_string()),
         // ("/sys/power/image_size", total_memory().to_string()),
-        ("/proc/sys/vm/page-cluster", "0".to_string()),
-        // ("/sys/module/zswap/parameters/enabled", "N".to_string()),
-        (
-            "/sys/module/zswap/parameters/shrinker_enabled",
-            "N".to_string(),
-        ),
-        ("/sys/module/zswap/parameters/compressor", "lz4".to_string()),
+        // ("/proc/sys/vm/page-cluster", "0".to_string()),
+        ("/sys/module/zswap/parameters/enabled", "N".to_string()),
+        // (
+        //     "/sys/module/zswap/parameters/shrinker_enabled",
+        //     "Y".to_string(),
+        // ),
+        // ("/sys/module/zswap/parameters/compressor", "lz4".to_string()),
         // (
         //     "/sys/module/zswap/parameters/max_pool_percent",
         //     "50".to_string(),
@@ -416,12 +416,13 @@ fn kernel_tweaks(revert: Option<Vec<String>>) -> Result<Vec<String>> {
         // https://github.com/pop-os/default-settings/blob/master_jammy/etc/sysctl.d/10-pop-default-settings.conf
         ("/proc/sys/vm/watermark_boost_factor", "0".to_string()),
         ("/proc/sys/vm/watermark_scale_factor", "125".to_string()),
-        ("/proc/sys/vm/vfs_cache_pressure", "50".to_string()),
         ("/proc/sys/vm/dirty_bytes", "268435456".to_string()),
+        // ("/proc/sys/vm/swappiness", "10".to_string()),
         (
             "/proc/sys/vm/dirty_background_bytes",
             "134217728".to_string(),
         ),
+        // ("/proc/sys/vm/vfs_cache_pressure", "50".to_string()),
     ];
 
     if let Some(revert) = revert {
@@ -489,7 +490,7 @@ fn main() {
         mlockall(MCL_CURRENT | MCL_FUTURE);
     }
 
-    let cfs_tweaks_prev = if ENABLE_KERNEL_TWEAKS {
+    let kernel_tweaks_prev = if ENABLE_KERNEL_TWEAKS {
         handle_error(kernel_tweaks(None))
     } else {
         None
@@ -516,7 +517,7 @@ fn main() {
                     process_cache.clear();
                 }
 
-                if let Some(cfs_tweaks_prev) = cfs_tweaks_prev {
+                if let Some(cfs_tweaks_prev) = kernel_tweaks_prev {
                     handle_error(kernel_tweaks(Some(cfs_tweaks_prev)));
                 }
 
@@ -570,7 +571,7 @@ fn main() {
             let mut buf = String::with_capacity(32 * 1024);
 
             let mut mp = MemoryPressure::new();
-            let mut poll_pressure = PollPressure::new(800000, 1000000);
+            let mut poll_pressure = PollPressure::full(850000, 1000000);
 
             let total_memory_kb = total_memory_kb();
 
@@ -579,7 +580,7 @@ fn main() {
 
                 poll_pressure.wait();
 
-                let pressure = mp.read();
+                let pressure = mp.read().full;
                 println!("memory pressure monitor event received (pressure={pressure})");
 
                 if pressure == 0 {
@@ -647,11 +648,53 @@ fn main() {
                         break;
                     }
                     thread::yield_now();
-                    if kill_start.elapsed().as_secs_f64() > 20.0 {
-                        println!("kill is taking too long, bailing");
+                    if kill_start.elapsed().as_secs_f64() > 60.0 {
+                        println!("kill is taking too long");
                         break;
                     }
                 }
+            }
+        });
+        scope.spawn(|| {
+            let mut poll_pressure = PollPressure::full(100000, 1000000);
+
+            loop {
+                println!("using zram writeback");
+
+                for device in read_dir("/sys/block").unwrap() {
+                    let device = device.unwrap();
+                    let device_name = device
+                        .path()
+                        .file_name()
+                        .unwrap()
+                        .as_str()
+                        .unwrap()
+                        .to_string();
+                    if device_name.starts_with("zram") {
+                        handle_error(
+                            write(device.path().join("writeback"), "huge_idle").wrap_err("zram"),
+                        );
+                        handle_error(write(device.path().join("idle"), "all").wrap_err("zram"));
+                        println!("wrote to device {device_name}")
+                    }
+                }
+
+                poll_pressure.wait();
+            }
+        });
+        scope.spawn(|| {
+            let mut poll_pressure = PollPressure::full(100000, 1000000);
+
+            loop {
+                let info = read_to_string("/proc/self/status").unwrap();
+                let rss = extract_num(&info, "VmRSS:").unwrap();
+                if rss > 1000000 {
+                    dbg!(&info, rss);
+                    println!("using too much memory!");
+                    abort();
+                }
+
+                poll_pressure.wait();
             }
         });
     });

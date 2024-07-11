@@ -11,13 +11,9 @@ path = "src/lib.rs"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-psutil = "3.1.0"
-flume = "0.10.2"
 libc = { version = "0.2.77", features = ["extra_traits"] }
-ctrlc = { version = "3.1.7", features = ["termination"] }
 serde = { version = "1.0.123", features = ["derive"] }
 serde_json = "1.0.64"
-crossbeam = "0.8"
 signal-hook = "0.3.6"
 color-eyre = "0.5.11"
 memmap = "0.7.0"
@@ -30,10 +26,12 @@ nix = { version = "0.28.0", features = ["ptrace"] }
 chrono = "0.4.38"
 tikv-jemallocator = { version = "0.5.4", features = ["profiling"] }
 rand = "0.8.5"
+rayon = "1.10.0"
+tikv-jemalloc-ctl = "0.5.4"
 
 [build-dependencies]
 cc = "1.0.69"
 
 [profile.release]
-debug = 1
+debug = 2
 panic = 'abort'
