@@ -17,7 +17,7 @@ pub struct MemoryPressure {
     buf: String,
 }
 
-#[derive(Clone, Copy, PartialEq, PartialOrd, Ord, Eq)]
+#[derive(Clone, Copy, PartialEq, PartialOrd, Ord, Eq, Debug)]
 pub struct MemoryPressureDelta {
     pub some: usize,
     pub full: usize,

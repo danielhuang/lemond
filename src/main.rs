@@ -102,7 +102,7 @@ fn set_nice(pid: u32, nice: i32) -> Result<()> {
     handle_libc_errno(unsafe { setpriority(libc::PRIO_PROCESS, pid as _, nice) })
 }
 
-pub fn handle_libc_errno(result: i32) -> std::result::Result<(), Report> {
+pub fn handle_libc_errno(result: i32) -> Result<()> {
     match result {
         0 => Ok(()),
         -1 => Err(Report::from(Error::last_os_error())),
@@ -265,8 +265,7 @@ fn is_critical(p: &ProcessHandle, state: Option<&State>) -> bool {
     if p.pid == std::process::id() {
         return LEMOND_SELF_REALTIME;
     }
-    let exe = &p.executable;
-    if let Some(exe) = exe {
+    if let Some(exe) = &p.executable {
         CRITICAL_PROCESSES.iter().any(|&x| exe == x)
     } else {
         false
@@ -657,9 +656,12 @@ fn main() {
         });
         scope.spawn(|| {
             let mut poll_pressure = PollPressure::full(100000, 1000000);
+            let mut mp = MemoryPressure::new();
 
             loop {
                 println!("using zram writeback");
+
+                dbg!(mp.read());
 
                 for device in read_dir("/sys/block").unwrap() {
                     let device = device.unwrap();
