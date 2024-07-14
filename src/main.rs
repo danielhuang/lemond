@@ -7,10 +7,10 @@ use lemond::config::{
     FORCE_ASSIGN_NORMAL_SCHEDULER, GDB_MLOCK_PROCESSES, LEMOND_SELF_REALTIME, LOW_PRIORITY_NICE,
     LOW_PRIORITY_PROCESSES, REALTIME_NICE, SCHED_IDLEPRIO, SOCKET_PATH, USE_THREAD_IDS,
 };
-use lemond::extract_num;
 use lemond::oom::{MemoryPressure, PollPressure};
 use lemond::proc::{get_all_pids, process_mrelease};
 use lemond::procmon::ProcMon;
+use lemond::{extract_num, handle_error, zram_util};
 use lemond::{proc::ProcessHandle, Message};
 use libc::{
     kill, mlockall, mmap, pid_t, rlimit, rlimit64, setpriority, waitpid, MCL_CURRENT, MCL_FUTURE,
@@ -271,14 +271,6 @@ fn is_critical(p: &ProcessHandle, state: Option<&State>) -> bool {
     } else {
         false
     }
-}
-
-#[track_caller]
-fn handle_error<T>(r: Result<T>) -> Option<T> {
-    if let Err(e) = &r {
-        println!("{e:?}");
-    }
-    r.ok()
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -658,36 +650,7 @@ fn main() {
             }
         });
         scope.spawn(|| {
-            let mut poll_pressure = PollPressure::full(100000, 1000000);
-
-            loop {
-                let devices: Vec<_> = read_dir("/sys/block").unwrap().collect();
-                if !devices.is_empty() {
-                    println!("activating zram writeback");
-                }
-                devices.into_par_iter().for_each(|device| {
-                    let device = device.unwrap();
-                    let device_name = device
-                        .path()
-                        .file_name()
-                        .unwrap()
-                        .as_str()
-                        .unwrap()
-                        .to_string();
-                    if device_name.starts_with("zram") {
-                        println!("writing {device_name} pages to disk");
-                        // declare all pages as idle...
-                        handle_error(write(device.path().join("idle"), "all").wrap_err("zram"));
-                        // then write to disk
-                        handle_error(
-                            write(device.path().join("writeback"), "idle").wrap_err("zram"),
-                        );
-                        println!("device {device_name} write complete")
-                    }
-                });
-
-                poll_pressure.wait();
-            }
+            zram_util::init();
         });
         scope.spawn(|| {
             let mut poll_pressure = PollPressure::full(100000, 1000000);
