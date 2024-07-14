@@ -28,6 +28,7 @@ tikv-jemallocator = { version = "0.5.4", features = ["profiling"] }
 rand = "0.8.5"
 rayon = "1.10.0"
 tikv-jemalloc-ctl = "0.5.4"
+neli = "0.6.4"
 
 [build-dependencies]
 cc = "1.0.69"

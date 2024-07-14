@@ -43,7 +43,7 @@ fn read_string_from_fd(fd: OwnedFd) -> Result<String> {
     Ok(buf)
 }
 
-fn read_string_from_dirfd(dirfd: BorrowedFd<'_>, path: &str) -> Result<String> {
+fn read_string_from_dirfd(dirfd: BorrowedFd<'_>, path: impl rustix::path::Arg) -> Result<String> {
     let fd = openat(dirfd, path, OFlags::RDONLY, Mode::empty())?;
     read_string_from_fd(fd)
 }

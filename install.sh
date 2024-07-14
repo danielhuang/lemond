@@ -12,4 +12,5 @@ sudo systemctl enable --now lemond
 
 # systemctl --user restart lemond-client
 
-systemctl status lemond
+systemctl --no-pager status lemond
+journalctl -u lemond -f

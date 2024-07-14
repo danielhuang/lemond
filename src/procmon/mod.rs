@@ -1,8 +1,10 @@
+use rustix::fd::{AsRawFd, FromRawFd, OwnedFd};
+
 mod procmon_sys;
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ProcMon {
-    nl_socket: i32,
+    fd: OwnedFd,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -21,51 +23,37 @@ pub struct Event {
     pub tgid: u32,
 }
 
-fn map_int_to_event_type(i: u32) -> Option<EventType> {
-    match i {
-        0 => None,
-        1 => Some(EventType::Fork),
-        2 => Some(EventType::Exec),
-        0x8000_0000 => Some(EventType::Exit),
-        _ => Some(EventType::Other),
-    }
-}
-
 impl ProcMon {
     pub fn new() -> Self {
-        let nls: i32 = unsafe { procmon_sys::nl_connect() };
         unsafe {
-            procmon_sys::update_nl(nls, true);
-        }
+            let fd: i32 = procmon_sys::nl_connect();
+            procmon_sys::update_nl(fd, true);
 
-        ProcMon { nl_socket: nls }
+            Self {
+                fd: OwnedFd::from_raw_fd(fd),
+            }
+        }
     }
 
     pub fn wait_for_event(&self) -> Event {
-        let mut event = procmon_sys::Event {
-            event_type: 0,
-            pid: 0,
-            ppid: 0,
-            tgid: 0,
-        };
+        let mut event = procmon_sys::Event::default();
 
         unsafe {
-            procmon_sys::wait_for_event(self.nl_socket, &mut event);
+            procmon_sys::wait_for_event(self.fd.as_raw_fd(), &mut event);
         };
 
         Event {
-            event_type: map_int_to_event_type(event.event_type),
+            event_type: match event.event_type {
+                0 => None,
+                1 => Some(EventType::Fork),
+                2 => Some(EventType::Exec),
+                0x80000000 => Some(EventType::Exit),
+                _ => Some(EventType::Other),
+            },
             pid: event.pid as _,
             ppid: event.ppid as _,
             tgid: event.tgid as _,
         }
-    }
-}
-
-impl Drop for ProcMon {
-    fn drop(&mut self) {
-        let fd = self.nl_socket;
-        assert!(unsafe { libc::close(fd) } == 0);
     }
 }
 

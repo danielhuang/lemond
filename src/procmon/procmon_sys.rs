@@ -1,4 +1,5 @@
 #[repr(C)]
+#[derive(Default)]
 pub struct Event {
     pub event_type: u32,
     pub pid: libc::pid_t,

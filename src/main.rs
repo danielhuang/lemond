@@ -16,6 +16,7 @@ use libc::{
     kill, mlockall, mmap, pid_t, rlimit, rlimit64, setpriority, waitpid, MCL_CURRENT, MCL_FUTURE,
     RLIMIT_CPU, RLIMIT_NICE, RLIMIT_RTPRIO, RLIMIT_RTTIME, RLIM_INFINITY,
 };
+use rayon::iter::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
 use rustix::fd::AsFd;
 use rustix::fs::{openat, Mode, OFlags};
 use rustix::path::Arg;
@@ -412,11 +413,12 @@ fn kernel_tweaks(revert: Option<Vec<String>>) -> Result<Vec<String>> {
         //     "/sys/module/zswap/parameters/max_pool_percent",
         //     "50".to_string(),
         // ),
+        ("/proc/sys/vm/watermark_scale_factor", "1".to_string()),
         // https://github.com/pop-os/default-settings/blob/master_jammy/etc/sysctl.d/10-pop-default-settings.conf
         ("/proc/sys/vm/watermark_boost_factor", "0".to_string()),
-        ("/proc/sys/vm/watermark_scale_factor", "125".to_string()),
+        // ("/proc/sys/vm/watermark_scale_factor", "125".to_string()),
         ("/proc/sys/vm/dirty_bytes", "268435456".to_string()),
-        // ("/proc/sys/vm/swappiness", "10".to_string()),
+        ("/proc/sys/vm/swappiness", "10".to_string()),
         (
             "/proc/sys/vm/dirty_background_bytes",
             "134217728".to_string(),
@@ -570,7 +572,7 @@ fn main() {
             let mut buf = String::with_capacity(32 * 1024);
 
             let mut mp = MemoryPressure::new();
-            let mut poll_pressure = PollPressure::full(850000, 1000000);
+            let mut poll_pressure = PollPressure::full(800000, 1000000);
 
             let total_memory_kb = total_memory_kb();
 
@@ -579,10 +581,10 @@ fn main() {
 
                 poll_pressure.wait();
 
-                let pressure = mp.read().full;
-                println!("memory pressure monitor event received (pressure={pressure})");
+                let pressure = mp.read();
+                println!("memory pressure monitor event received (pressure={pressure:?})");
 
-                if pressure == 0 {
+                if pressure.full == 0 {
                     println!("pressure not above threshold");
                     continue;
                 }
@@ -602,6 +604,7 @@ fn main() {
                 let (&pid, handle, mem_used_kb) = cache
                     .iter()
                     .filter_map(|(pid, process)| process.as_ref().map(|process| (pid, process)))
+                    .filter(|(_, handle)| !is_critical(handle, None))
                     .map(|(pid, process)| {
                         if let Ok(mut file) = openat(process.proc_dirfd.as_fd(), "status", OFlags::RDONLY, Mode::empty()).map(File::from) {
                             buf.clear();
@@ -656,14 +659,13 @@ fn main() {
         });
         scope.spawn(|| {
             let mut poll_pressure = PollPressure::full(100000, 1000000);
-            let mut mp = MemoryPressure::new();
 
             loop {
-                println!("using zram writeback");
-
-                dbg!(mp.read());
-
-                for device in read_dir("/sys/block").unwrap() {
+                let devices: Vec<_> = read_dir("/sys/block").unwrap().collect();
+                if !devices.is_empty() {
+                    println!("activating zram writeback");
+                }
+                devices.into_par_iter().for_each(|device| {
                     let device = device.unwrap();
                     let device_name = device
                         .path()
@@ -673,13 +675,16 @@ fn main() {
                         .unwrap()
                         .to_string();
                     if device_name.starts_with("zram") {
-                        handle_error(
-                            write(device.path().join("writeback"), "huge_idle").wrap_err("zram"),
-                        );
+                        println!("writing {device_name} pages to disk");
+                        // declare all pages as idle...
                         handle_error(write(device.path().join("idle"), "all").wrap_err("zram"));
-                        println!("wrote to device {device_name}")
+                        // then write to disk
+                        handle_error(
+                            write(device.path().join("writeback"), "idle").wrap_err("zram"),
+                        );
+                        println!("device {device_name} write complete")
                     }
-                }
+                });
 
                 poll_pressure.wait();
             }
