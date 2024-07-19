@@ -1,5 +1,6 @@
 use color_eyre::eyre::{eyre, Context, ContextCompat, Result};
 use color_eyre::Report;
+use itertools::Itertools;
 use libc::{
     iovec, prlimit64, rlimit64, MCL_CURRENT, MCL_FUTURE, MCL_ONFAULT, RLIMIT_MEMLOCK, RLIM_INFINITY,
 };
@@ -8,7 +9,7 @@ use once_cell::sync::OnceCell;
 use rustix::fd::{AsFd, BorrowedFd};
 use rustix::fs::{open, openat, readlinkat, Dir, Mode, OFlags, RawDir};
 use rustix::process::{pidfd_getfd, pidfd_open, ForeignRawFd, Pid, PidfdFlags, PidfdGetfdFlags};
-use std::io::Read;
+use std::io::{IoSlice, IoSliceMut, Read};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -19,9 +20,9 @@ use std::{
     thread,
 };
 use std::{io, ptr};
-use syscalls::{syscall, Sysno};
+use syscalls::{syscall, Errno, Sysno};
 
-use crate::extract_num;
+use crate::{extract_num, DEBUG};
 
 #[derive(Debug, Clone)]
 pub struct ProcessHandle {
@@ -46,6 +47,30 @@ fn read_string_from_fd(fd: OwnedFd) -> Result<String> {
 fn read_string_from_dirfd(dirfd: BorrowedFd<'_>, path: impl rustix::path::Arg) -> Result<String> {
     let fd = openat(dirfd, path, OFlags::RDONLY, Mode::empty())?;
     read_string_from_fd(fd)
+}
+
+/// https://stackoverflow.com/questions/1401359/understanding-linux-proc-pid-maps-or-proc-self-maps
+#[derive(Debug, Clone)]
+pub struct ProcessMemoryRegion {
+    pub address: usize,
+    pub len: usize,
+    pub can_read: bool,
+    pub can_write: bool,
+    pub can_exec: bool,
+    pub is_private: bool,
+    pub offset: usize,
+    pub dev: String,
+    pub inode: usize,
+    pub pathname: Option<String>,
+}
+
+impl ProcessMemoryRegion {
+    pub unsafe fn as_remote_iovec(&self) -> iovec {
+        iovec {
+            iov_base: self.address as _,
+            iov_len: self.len as _,
+        }
+    }
 }
 
 impl ProcessHandle {
@@ -185,6 +210,54 @@ impl ProcessHandle {
             fd_mmaps: Arc::new(OnceCell::new()),
         })
     }
+
+    pub fn maps(&self) -> Result<Vec<ProcessMemoryRegion>> {
+        Ok(read_string_from_dirfd(self.proc_dirfd.as_fd(), "maps")?
+            .trim()
+            .lines()
+            .map(|line| {
+                let parts = line.split_whitespace().collect_vec();
+                let (addr, perms, offset, dev, inode, pathname) = match &*parts {
+                    [addr, perms, offset, dev, inode, pathname, ..] => {
+                        (addr, perms, offset, dev, inode, Some(pathname))
+                    }
+                    [addr, perms, offset, dev, inode] => (addr, perms, offset, dev, inode, None),
+                    _ => unreachable!(),
+                };
+                let (start, end) = addr.split_once('-').unwrap();
+                ProcessMemoryRegion {
+                    address: usize::from_str_radix(start, 16).unwrap(),
+                    len: usize::from_str_radix(end, 16).unwrap()
+                        - usize::from_str_radix(start, 16).unwrap(),
+                    can_read: perms.contains('r'),
+                    can_write: perms.contains('w'),
+                    can_exec: perms.contains('x'),
+                    is_private: perms.contains('p'),
+                    offset: usize::from_str_radix(offset, 16).unwrap(),
+                    dev: dev.to_string(),
+                    inode: inode.parse().unwrap(),
+                    pathname: pathname.map(|x| x.to_string()),
+                }
+            })
+            .collect())
+    }
+
+    pub fn read_all_maps(&self) -> Result<usize> {
+        let maps = self.maps()?.into_iter().filter(|x| x.can_read);
+        let iovecs = maps
+            .into_iter()
+            .map(|x| unsafe { x.as_remote_iovec() })
+            .collect_vec();
+        let len: usize = iovecs.iter().map(|x| x.iov_len).sum();
+        let mut buf = vec![0; len];
+        unsafe {
+            Ok(process_vm_readv(
+                self.pid,
+                &mut [IoSliceMut::new(&mut buf)],
+                &iovecs,
+            )?)
+        }
+    }
 }
 
 fn drop_mmap_on_thread<T: Send + 'static>(x: &mut Arc<OnceCell<T>>) {
@@ -199,13 +272,14 @@ fn drop_mmap_on_thread<T: Send + 'static>(x: &mut Arc<OnceCell<T>>) {
 
 impl Drop for ProcessHandle {
     fn drop(&mut self) {
-        #[cfg(debug_assertions)]
-        if let Some(x) = Arc::get_mut(&mut self.executable_mmap) {
-            if x.get().is_some() {
-                println!("dropping a process handle");
-                dbg!(&self);
-                let bt = std::backtrace::Backtrace::capture();
-                println!("{bt}");
+        if DEBUG {
+            if let Some(x) = Arc::get_mut(&mut self.executable_mmap) {
+                if x.get().is_some() {
+                    println!("dropping a process handle");
+                    dbg!(&self);
+                    let bt = std::backtrace::Backtrace::capture();
+                    println!("{bt}");
+                }
             }
         }
 
@@ -275,4 +349,23 @@ pub fn process_mrelease(pidfd: BorrowedFd, flags: u32) -> Result<usize> {
         syscall!(Sysno::process_mrelease, pidfd.as_raw_fd(), flags)
             .wrap_err_with(|| format!("pidfd={pidfd:?}"))
     }
+}
+
+/// # Safety
+/// https://manpages.debian.org/unstable/manpages-dev/process_vm_readv.2.en.html
+/// Local iovecs must be real, but remote iovecs are in the address space of the target process
+pub unsafe fn process_vm_readv(
+    pid: u32,
+    local_iov: &mut [IoSliceMut<'_>],
+    remote_iov: &[iovec],
+) -> Result<usize, Errno> {
+    syscall!(
+        Sysno::process_vm_readv,
+        pid,
+        local_iov.as_ptr(),
+        local_iov.len(),
+        remote_iov.as_ptr(),
+        remote_iov.len(),
+        0
+    )
 }

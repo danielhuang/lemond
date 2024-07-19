@@ -26,3 +26,9 @@ pub mod proc;
 pub mod procmon;
 pub mod trace;
 pub mod zram_util;
+
+#[cfg(debug_assertions)]
+pub const DEBUG: bool = true;
+
+#[cfg(not(debug_assertions))]
+pub const DEBUG: bool = false;

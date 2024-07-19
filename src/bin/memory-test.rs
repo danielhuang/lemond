@@ -15,7 +15,7 @@ fn main() {
             s.spawn(|| {
                 let mut bufs = Vec::with_capacity(1024 * 1024);
 
-                while start.elapsed().as_secs() < 90 {
+                while start.elapsed().as_secs() < 120 {
                     let v = vec![1u8; amount * 1024 * 1024];
                     black_box(&v);
                     bufs.push(v);

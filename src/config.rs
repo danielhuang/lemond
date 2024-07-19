@@ -66,6 +66,8 @@ pub const ENABLE_SOCKET: bool = true;
 pub const ENABLE_EXE_MLOCK: bool = false;
 pub const ENABLE_LOCK_FDS: bool = false;
 pub const ENABLE_GDB_MLOCK: bool = true;
+pub const ENABLE_MEMORY_READ: bool = false;
+pub const ENABLE_ZRAM_WRITEBACK: bool = false;
 
 pub const ENABLE_KERNEL_TWEAKS: bool = true;
 

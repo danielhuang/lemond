@@ -3,14 +3,15 @@ use color_eyre::eyre::{Context, Result};
 use color_eyre::{Help, Report};
 use lemond::config::{
     BOOST_NICE, CRITICAL_PROCESSES, ENABLE_EXE_MLOCK, ENABLE_GDB_MLOCK, ENABLE_KERNEL_TWEAKS,
-    ENABLE_LOCK_FDS, ENABLE_NICE, ENABLE_REALTIME, ENABLE_SOCKET, EXCLUDE_REALTIME,
-    FORCE_ASSIGN_NORMAL_SCHEDULER, GDB_MLOCK_PROCESSES, LEMOND_SELF_REALTIME, LOW_PRIORITY_NICE,
-    LOW_PRIORITY_PROCESSES, REALTIME_NICE, SCHED_IDLEPRIO, SOCKET_PATH, USE_THREAD_IDS,
+    ENABLE_LOCK_FDS, ENABLE_MEMORY_READ, ENABLE_NICE, ENABLE_REALTIME, ENABLE_SOCKET,
+    ENABLE_ZRAM_WRITEBACK, EXCLUDE_REALTIME, FORCE_ASSIGN_NORMAL_SCHEDULER, GDB_MLOCK_PROCESSES,
+    LEMOND_SELF_REALTIME, LOW_PRIORITY_NICE, LOW_PRIORITY_PROCESSES, REALTIME_NICE, SCHED_IDLEPRIO,
+    SOCKET_PATH, USE_THREAD_IDS,
 };
-use lemond::oom::{MemoryPressure, PollPressure};
+use lemond::oom::{PsiLevel, PsiPoll, PsiReader};
 use lemond::proc::{get_all_pids, process_mrelease};
 use lemond::procmon::ProcMon;
-use lemond::{extract_num, handle_error, zram_util};
+use lemond::{extract_num, handle_error, zram_util, DEBUG};
 use lemond::{proc::ProcessHandle, Message};
 use libc::{
     kill, mlockall, mmap, pid_t, rlimit, rlimit64, setpriority, waitpid, MCL_CURRENT, MCL_FUTURE,
@@ -229,8 +230,9 @@ fn set_all(p: &ProcessHandle, f: fn(&ProcessHandle, u32) -> Result<()>) -> Resul
 
 fn try_set_all(p: &ProcessHandle, f: fn(&ProcessHandle, u32) -> Result<()>) {
     let e = set_all(p, f).with_note(|| format!("handle={p:?}"));
-    #[cfg(debug_assertions)]
-    handle_error(e);
+    if DEBUG {
+        handle_error(e);
+    }
 }
 
 fn is_child_of(
@@ -364,7 +366,7 @@ fn total_memory() -> usize {
 fn kernel_tweaks(revert: Option<Vec<String>>) -> Result<Vec<String>> {
     let values: Vec<(&'static str, String)> = vec![
         // ("/proc/sys/vm/compaction_proactiveness", "0".to_string()),
-        // ("/proc/sys/vm/min_free_kbytes", "4194304".to_string()),
+        ("/proc/sys/vm/min_free_kbytes", "1048576".to_string()),
         // ("/sys/kernel/mm/lru_gen/enabled", "5".to_string()),
         // ("/sys/kernel/mm/lru_gen/min_ttl_ms", "0".to_string()),
         // ("/proc/sys/vm/zone_reclaim_mode", "0".to_string()),
@@ -382,7 +384,7 @@ fn kernel_tweaks(revert: Option<Vec<String>>) -> Result<Vec<String>> {
         // ),
         // ("/proc/sys/vm/page_lock_unfairness", "1".to_string()),
         // ("/proc/sys/kernel/sched_child_runs_first", "0".to_string()),
-        ("/proc/sys/kernel/sched_autogroup_enabled", "0".to_string()),
+        // ("/proc/sys/kernel/sched_autogroup_enabled", "0".to_string()),
         // (
         //     "/proc/sys/kernel/sched_cfs_bandwidth_slice_us",
         //     "500".to_string(),
@@ -405,10 +407,12 @@ fn kernel_tweaks(revert: Option<Vec<String>>) -> Result<Vec<String>> {
         //     "/sys/module/zswap/parameters/max_pool_percent",
         //     "50".to_string(),
         // ),
-        ("/proc/sys/vm/watermark_scale_factor", "1".to_string()),
+        // ("/proc/sys/vm/watermark_scale_factor", "1".to_string()),
+        // ("/proc/sys/vm/watermark_boost_factor", "0".to_string()),
+        // ("/proc/sys/vm/watermark_scale_factor", "2000".to_string()),
         // https://github.com/pop-os/default-settings/blob/master_jammy/etc/sysctl.d/10-pop-default-settings.conf
         ("/proc/sys/vm/watermark_boost_factor", "0".to_string()),
-        // ("/proc/sys/vm/watermark_scale_factor", "125".to_string()),
+        ("/proc/sys/vm/watermark_scale_factor", "125".to_string()),
         ("/proc/sys/vm/dirty_bytes", "268435456".to_string()),
         ("/proc/sys/vm/swappiness", "10".to_string()),
         (
@@ -505,13 +509,10 @@ fn main() {
 
                 handle_error(cleanup());
 
-                {
-                    let mut process_cache = process_cache.lock().unwrap();
-                    process_cache.clear();
-                }
+                process_cache.lock().unwrap().clear();
 
-                if let Some(cfs_tweaks_prev) = kernel_tweaks_prev {
-                    handle_error(kernel_tweaks(Some(cfs_tweaks_prev)));
+                if let Some(kernel_tweaks_prev) = kernel_tweaks_prev {
+                    handle_error(kernel_tweaks(Some(kernel_tweaks_prev)));
                 }
 
                 exit(0);
@@ -563,8 +564,8 @@ fn main() {
         scope.spawn(|| {
             let mut buf = String::with_capacity(32 * 1024);
 
-            let mut mp = MemoryPressure::new();
-            let mut poll_pressure = PollPressure::full(800000, 1000000);
+            let mut mp = PsiReader::memory();
+            let mut poll_pressure = PsiPoll::memory(800000, 1000000,PsiLevel::Full);
 
             let total_memory_kb = total_memory_kb();
 
@@ -650,10 +651,12 @@ fn main() {
             }
         });
         scope.spawn(|| {
-            zram_util::init();
+            if ENABLE_ZRAM_WRITEBACK {
+                zram_util::init();
+            }
         });
         scope.spawn(|| {
-            let mut poll_pressure = PollPressure::full(100000, 1000000);
+            let mut poll_pressure = PsiPoll::memory(100000, 1000000, PsiLevel::Full);
 
             loop {
                 let info = read_to_string("/proc/self/status").unwrap();
@@ -707,6 +710,9 @@ fn update_single_process(
                     .any(|&x| process.executable.as_deref() == Some(x))
             {
                 handle_error(process.gdb_lock_all());
+            }
+            if ENABLE_MEMORY_READ {
+                dbg!(&process.read_all_maps());
             }
         } else if is_child_of(
             process,
