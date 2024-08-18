@@ -35,6 +35,14 @@ pub struct ProcessHandle {
     pub fd_mmaps: Arc<OnceCell<Vec<Result<Mmap, std::io::Error>>>>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ThreadHandle {
+    pub pid: u32,
+    pub tid: u32,
+    pub comm: String,
+    pub proc_dirfd: Arc<OwnedFd>,
+}
+
 const THREADED_DROP: bool = false;
 
 fn read_string_from_fd(fd: OwnedFd) -> Result<String> {
@@ -68,7 +76,7 @@ impl ProcessMemoryRegion {
     pub unsafe fn as_remote_iovec(&self) -> iovec {
         iovec {
             iov_base: self.address as _,
-            iov_len: self.len as _,
+            iov_len: self.len,
         }
     }
 }
@@ -85,6 +93,32 @@ impl ProcessHandle {
     pub fn thread_ids(&self) -> Result<Vec<u32>> {
         let tasks = openat(&self.proc_dirfd, "task", OFlags::DIRECTORY, Mode::empty())?;
         ls_dir_fd_ints(tasks.as_fd())
+    }
+
+    pub fn threads(&self) -> Result<Vec<ThreadHandle>> {
+        let tasks = openat(&self.proc_dirfd, "task", OFlags::DIRECTORY, Mode::empty())?;
+
+        let thread_ids = ls_dir_fd_ints(tasks.as_fd())?;
+        thread_ids
+            .into_iter()
+            .map(|tid| {
+                let proc_dirfd = openat(
+                    tasks.as_fd(),
+                    tid.to_string(),
+                    OFlags::DIRECTORY,
+                    Mode::empty(),
+                )?;
+
+                Ok(ThreadHandle {
+                    pid: self.pid,
+                    tid,
+                    comm: read_string_from_dirfd(proc_dirfd.as_fd(), "comm")?
+                        .trim()
+                        .to_string(),
+                    proc_dirfd: Arc::new(proc_dirfd),
+                })
+            })
+            .collect()
     }
 
     pub fn lock_executable(&self) -> Result<()> {
@@ -242,21 +276,34 @@ impl ProcessHandle {
             .collect())
     }
 
-    pub fn read_all_maps(&self) -> Result<usize> {
+    pub fn read_all_maps(&self, max_chunk_size: usize) -> Result<usize> {
         let maps = self.maps()?.into_iter().filter(|x| x.can_read);
-        let iovecs = maps
-            .into_iter()
-            .map(|x| unsafe { x.as_remote_iovec() })
-            .collect_vec();
-        let len: usize = iovecs.iter().map(|x| x.iov_len).sum();
-        let mut buf = vec![0; len];
-        unsafe {
-            Ok(process_vm_readv(
-                self.pid,
-                &mut [IoSliceMut::new(&mut buf)],
-                &iovecs,
-            )?)
+        let iovecs = maps.into_iter().map(|x| unsafe { x.as_remote_iovec() });
+
+        let mut bytes_read = 0;
+
+        let mut buf = vec![0; max_chunk_size];
+        for v in iovecs {
+            let mut i = 0;
+            while i < v.iov_len {
+                let remaining = v.iov_len - i;
+                let iovec_chunk = iovec {
+                    iov_base: unsafe { v.iov_base.byte_add(i) },
+                    iov_len: remaining.min(max_chunk_size),
+                };
+                unsafe {
+                    bytes_read += process_vm_readv(
+                        self.pid,
+                        &mut [IoSliceMut::new(&mut buf)],
+                        &[iovec_chunk],
+                    )
+                    .unwrap_or(0);
+                }
+                i += iovec_chunk.iov_len;
+            }
+            assert!(i == v.iov_len);
         }
+        Ok(bytes_read)
     }
 }
 
@@ -353,7 +400,7 @@ pub fn process_mrelease(pidfd: BorrowedFd, flags: u32) -> Result<usize> {
 
 /// # Safety
 /// https://manpages.debian.org/unstable/manpages-dev/process_vm_readv.2.en.html
-/// Local iovecs must be real, but remote iovecs are in the address space of the target process
+/// Remote iovecs are in the address space of the target process
 pub unsafe fn process_vm_readv(
     pid: u32,
     local_iov: &mut [IoSliceMut<'_>],

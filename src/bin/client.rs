@@ -1,4 +1,5 @@
 use color_eyre::eyre::{eyre, Result};
+use lemond::config::SOCKET_PATH;
 use std::process::{id, Command};
 use std::{os::unix::net::UnixDatagram, thread, time::Duration};
 
@@ -6,7 +7,7 @@ use lemond::Message;
 
 fn run() -> Result<()> {
     let socket = UnixDatagram::unbound()?;
-    socket.connect("/run/lemond.socket")?;
+    socket.connect(SOCKET_PATH)?;
 
     let client_pid = id();
     socket.send(serde_json::to_string(&Message::SetClientPid { pid: client_pid })?.as_bytes())?;

@@ -1,6 +1,7 @@
 use cancellable_timer::Timer;
 use color_eyre::eyre::{Context, Result};
 use color_eyre::{Help, Report};
+use defaultmap::DefaultHashMap;
 use lemond::config::{
     BOOST_NICE, CRITICAL_PROCESSES, ENABLE_EXE_MLOCK, ENABLE_GDB_MLOCK, ENABLE_KERNEL_TWEAKS,
     ENABLE_LOCK_FDS, ENABLE_MEMORY_READ, ENABLE_NICE, ENABLE_REALTIME, ENABLE_SOCKET,
@@ -22,7 +23,8 @@ use rustix::fd::AsFd;
 use rustix::fs::{openat, Mode, OFlags};
 use rustix::path::Arg;
 use rustix::process::{
-    pidfd_open, pidfd_send_signal, prlimit, Pid, PidfdFlags, Resource, Rlimit, Signal,
+    pidfd_open, pidfd_send_signal, prlimit, setpriority_process, Pid, PidfdFlags, Resource, Rlimit,
+    Signal,
 };
 use signal_hook::consts::signal::*;
 use signal_hook::iterator::Signals;
@@ -149,55 +151,46 @@ fn set_scheduler(pid: u32, policy: i32, nice: i32, prio: i32, reset_on_fork: boo
 }
 
 fn set_realtime(p: &ProcessHandle, pid: u32) -> Result<()> {
-    let i = p
-        .executable
-        .as_ref()
-        .and_then(|x| CRITICAL_PROCESSES.iter().position(|&s| x == s))
-        .unwrap_or(10);
+    let i = 10;
 
     let is_lemond = id() == p.pid;
 
-    if ENABLE_REALTIME
-        && p.executable
-            .as_ref()
-            .is_some_and(|x| !EXCLUDE_REALTIME.contains(&x.as_str()))
-    {
-        let limit = rlimit64 {
-            rlim_cur: RLIM_INFINITY,
-            rlim_max: RLIM_INFINITY,
-        };
+    if ENABLE_REALTIME {
+        if let Some(exe) = p.executable.as_ref() {
+            let limit = rlimit64 {
+                rlim_cur: RLIM_INFINITY,
+                rlim_max: RLIM_INFINITY,
+            };
 
-        // workaround https://gitlab.freedesktop.org/drm/amd/-/issues/2861
-        // also see ~/.config/environment.d/mutter.conf
-        for rlimit in [RLIMIT_RTTIME, RLIMIT_CPU, RLIMIT_RTPRIO, RLIMIT_NICE] {
-            handle_error(unsafe {
-                syscall!(
-                    Sysno::prlimit64,
-                    pid as pid_t,
-                    rlimit,
-                    &limit as *const rlimit64,
-                    0
-                )
-                .wrap_err_with(|| format!("rlimit={rlimit}"))
-            });
+            // workaround https://gitlab.freedesktop.org/drm/amd/-/issues/2861
+            // also see ~/.config/environment.d/mutter.conf
+            for rlimit in [RLIMIT_RTTIME, RLIMIT_CPU, RLIMIT_RTPRIO, RLIMIT_NICE] {
+                handle_error(unsafe {
+                    syscall!(
+                        Sysno::prlimit64,
+                        pid as pid_t,
+                        rlimit,
+                        &limit as *const rlimit64,
+                        0
+                    )
+                    .wrap_err_with(|| format!("pid={pid} p={p:?} rlimit={rlimit}"))
+                });
+            }
+
+            if !EXCLUDE_REALTIME.contains(&exe.as_str()) {
+                set_scheduler(
+                    pid,
+                    libc::SCHED_FIFO,
+                    REALTIME_NICE,
+                    99 - i,
+                    !(is_lemond && LEMOND_SELF_REALTIME),
+                )?;
+            }
         }
 
-        set_scheduler(
-            pid,
-            libc::SCHED_FIFO,
-            REALTIME_NICE,
-            99 - i as i32,
-            !(is_lemond && LEMOND_SELF_REALTIME),
-        )?;
-    } else {
-        set_scheduler(
-            pid,
-            libc::SCHED_OTHER,
-            REALTIME_NICE,
-            0,
-            !(is_lemond && LEMOND_SELF_REALTIME),
-        )?;
+        setpriority_process(Some(Pid::from_raw(pid as _).unwrap()), REALTIME_NICE)?;
     }
+
     Ok(())
 }
 
@@ -206,8 +199,15 @@ fn set_boosted(_: &ProcessHandle, pid: u32) -> Result<()> {
     Ok(())
 }
 
-fn set_normal(_: &ProcessHandle, pid: u32) -> Result<()> {
-    set_scheduler(pid, libc::SCHED_OTHER, 0, 0, false)?;
+fn set_normal(p: &ProcessHandle, pid: u32) -> Result<()> {
+    if p.executable
+        .as_ref()
+        .is_some_and(|x| EXCLUDE_REALTIME.contains(&x.as_str()))
+    {
+        setpriority_process(Some(Pid::from_raw(pid as _).unwrap()), REALTIME_NICE)?;
+    } else {
+        set_scheduler(pid, libc::SCHED_OTHER, 0, 0, false)?;
+    }
     Ok(())
 }
 
@@ -216,20 +216,35 @@ fn set_low_priority(_: &ProcessHandle, pid: u32) -> Result<()> {
     Ok(())
 }
 
-fn set_all(p: &ProcessHandle, f: fn(&ProcessHandle, u32) -> Result<()>) -> Result<()> {
-    f(p, p.pid)?;
+fn set_all(
+    p: &ProcessHandle,
+    thread_filter: Option<&[&str]>,
+    f: fn(&ProcessHandle, u32) -> Result<()>,
+) -> Result<()> {
+    if thread_filter.is_none() {
+        f(p, p.pid)?;
+    }
     if USE_THREAD_IDS {
-        if let Ok(thread_ids) = p.thread_ids() {
-            for tid in thread_ids {
-                f(p, tid)?;
+        if let Ok(threads) = p.threads() {
+            for thread in threads {
+                if let Some(thread_filter) = thread_filter {
+                    if !thread_filter.contains(&&*thread.comm) {
+                        continue;
+                    }
+                }
+                f(p, thread.tid)?;
             }
         }
     }
     Ok(())
 }
 
-fn try_set_all(p: &ProcessHandle, f: fn(&ProcessHandle, u32) -> Result<()>) {
-    let e = set_all(p, f).with_note(|| format!("handle={p:?}"));
+fn try_set_all(
+    p: &ProcessHandle,
+    thread_filter: Option<&[&str]>,
+    f: fn(&ProcessHandle, u32) -> Result<()>,
+) {
+    let e = set_all(p, thread_filter, f).with_note(|| format!("handle={p:?}"));
     if DEBUG {
         handle_error(e);
     }
@@ -259,19 +274,32 @@ fn is_equal_or_child_of(
     predicate(x) || is_child_of(x, predicate, process_cache)
 }
 
-fn is_critical(p: &ProcessHandle, state: Option<&State>) -> bool {
+fn get_critical_entry(
+    p: &ProcessHandle,
+    state: Option<&State>,
+) -> Option<Option<&'static [&'static str]>> {
+    fn self_realtime() -> Option<Option<&'static [&'static str]>> {
+        if LEMOND_SELF_REALTIME {
+            Some(None)
+        } else {
+            None
+        }
+    }
+
     if let Some(pid) = state.and_then(|x| x.client_pid) {
         if p.pid == pid {
-            return LEMOND_SELF_REALTIME;
+            return self_realtime();
         }
     }
     if p.pid == std::process::id() {
-        return LEMOND_SELF_REALTIME;
+        return self_realtime();
     }
     if let Some(exe) = &p.executable {
-        CRITICAL_PROCESSES.iter().any(|&x| exe == x)
+        CRITICAL_PROCESSES
+            .iter()
+            .find_map(|&x| (exe == x.0).then_some(x.1))
     } else {
-        false
+        None
     }
 }
 
@@ -341,9 +369,13 @@ fn cleanup() -> Result<()> {
         .collect();
     for process in all_processes.into_iter().flatten() {
         if process.executable.is_some()
-            && is_equal_or_child_of(&process, |parent| is_critical(parent, None), &process_cache)
+            && is_equal_or_child_of(
+                &process,
+                |parent| get_critical_entry(parent, None).is_some(),
+                &process_cache,
+            )
         {
-            set_all(&process, set_normal)?;
+            set_all(&process, None, set_normal)?;
         }
     }
     Ok(())
@@ -384,7 +416,7 @@ fn kernel_tweaks(revert: Option<Vec<String>>) -> Result<Vec<String>> {
         // ),
         // ("/proc/sys/vm/page_lock_unfairness", "1".to_string()),
         // ("/proc/sys/kernel/sched_child_runs_first", "0".to_string()),
-        // ("/proc/sys/kernel/sched_autogroup_enabled", "0".to_string()),
+        ("/proc/sys/kernel/sched_autogroup_enabled", "0".to_string()),
         // (
         //     "/proc/sys/kernel/sched_cfs_bandwidth_slice_us",
         //     "500".to_string(),
@@ -396,7 +428,7 @@ fn kernel_tweaks(revert: Option<Vec<String>>) -> Result<Vec<String>> {
         // ("/sys/kernel/debug/sched/nr_migrate", "8".to_string()),
         // ("/sys/power/image_size", "0".to_string()),
         // ("/sys/power/image_size", total_memory().to_string()),
-        // ("/proc/sys/vm/page-cluster", "0".to_string()),
+        ("/proc/sys/vm/page-cluster", "0".to_string()),
         ("/sys/module/zswap/parameters/enabled", "N".to_string()),
         // (
         //     "/sys/module/zswap/parameters/shrinker_enabled",
@@ -407,14 +439,15 @@ fn kernel_tweaks(revert: Option<Vec<String>>) -> Result<Vec<String>> {
         //     "/sys/module/zswap/parameters/max_pool_percent",
         //     "50".to_string(),
         // ),
+        ("/proc/sys/vm/swappiness", "1".to_string()),
         // ("/proc/sys/vm/watermark_scale_factor", "1".to_string()),
         // ("/proc/sys/vm/watermark_boost_factor", "0".to_string()),
         // ("/proc/sys/vm/watermark_scale_factor", "2000".to_string()),
         // https://github.com/pop-os/default-settings/blob/master_jammy/etc/sysctl.d/10-pop-default-settings.conf
-        ("/proc/sys/vm/watermark_boost_factor", "0".to_string()),
-        ("/proc/sys/vm/watermark_scale_factor", "125".to_string()),
+        // ("/proc/sys/vm/watermark_boost_factor", "0".to_string()),
+        // ("/proc/sys/vm/watermark_scale_factor", "125".to_string()),
         ("/proc/sys/vm/dirty_bytes", "268435456".to_string()),
-        ("/proc/sys/vm/swappiness", "10".to_string()),
+        // ("/proc/sys/vm/swappiness", "180".to_string()),
         (
             "/proc/sys/vm/dirty_background_bytes",
             "134217728".to_string(),
@@ -475,11 +508,13 @@ fn main() {
 
     assert!(CRITICAL_PROCESSES
         .iter()
+        .map(|x| &x.0)
         .collect::<HashSet<_>>()
         .is_superset(&GDB_MLOCK_PROCESSES.iter().collect::<HashSet<_>>()));
 
     assert!(CRITICAL_PROCESSES
         .iter()
+        .map(|x| &x.0)
         .collect::<HashSet<_>>()
         .is_superset(&EXCLUDE_REALTIME.iter().collect::<HashSet<_>>()));
 
@@ -498,25 +533,25 @@ fn main() {
     println!("started");
 
     thread::scope(|scope| {
-        scope.spawn({
-            || {
-                signals.forever().next();
-                println!("exiting, setting processes back to normal");
+        scope.spawn(|| {
+            signals.forever().next();
+            println!("exiting, setting processes back to normal");
 
-                running.store(false, Ordering::Release);
-                canceller.cancel().unwrap();
-                drop(state.lock().unwrap());
-
-                handle_error(cleanup());
-
-                process_cache.lock().unwrap().clear();
-
-                if let Some(kernel_tweaks_prev) = kernel_tweaks_prev {
-                    handle_error(kernel_tweaks(Some(kernel_tweaks_prev)));
-                }
-
-                exit(0);
+            if let Some(kernel_tweaks_prev) = kernel_tweaks_prev {
+                handle_error(kernel_tweaks(Some(kernel_tweaks_prev)));
             }
+
+            running.store(false, Ordering::Release);
+            canceller.cancel().unwrap();
+            if let Err(e) = state.lock() {
+                dbg!(&e);
+            }
+
+            handle_error(cleanup());
+
+            process_cache.lock().unwrap().clear();
+
+            exit(0);
         });
         if ENABLE_SOCKET {
             scope.spawn(|| {
@@ -565,7 +600,7 @@ fn main() {
             let mut buf = String::with_capacity(32 * 1024);
 
             let mut mp = PsiReader::memory();
-            let mut poll_pressure = PsiPoll::memory(800000, 1000000,PsiLevel::Full);
+            let mut poll_pressure = PsiPoll::memory(900000 * 2, 1000000 * 2,PsiLevel::Some);
 
             let total_memory_kb = total_memory_kb();
 
@@ -575,7 +610,7 @@ fn main() {
                 poll_pressure.wait();
 
                 let pressure = mp.read();
-                println!("memory pressure monitor event received (pressure={pressure:?})");
+                println!("<4>memory pressure monitor event received (pressure={pressure:?})");
 
                 if pressure.full == 0 {
                     println!("pressure not above threshold");
@@ -597,7 +632,7 @@ fn main() {
                 let (&pid, handle, mem_used_kb) = cache
                     .iter()
                     .filter_map(|(pid, process)| process.as_ref().map(|process| (pid, process)))
-                    .filter(|(_, handle)| !is_critical(handle, None))
+                    .filter(|(_, handle)| get_critical_entry(handle, None).is_none())
                     .map(|(pid, process)| {
                         if let Ok(mut file) = openat(process.proc_dirfd.as_fd(), "status", OFlags::RDONLY, Mode::empty()).map(File::from) {
                             buf.clear();
@@ -618,16 +653,16 @@ fn main() {
                 };
 
                 println!(
-                    "found target (pid={}, pidfd={pidfd:?} exe={:?} mem_used_kb={mem_used_kb:?} critical={}) took {:?} to find",
+                    "<4>found target (pid={}, pidfd={pidfd:?} exe={:?} mem_used_kb={mem_used_kb:?} critical={}) took {:?} to find",
                     pid,
                     handle.executable,
-                    is_critical(handle, None),
+                    get_critical_entry(handle, None).is_some(),
                     start.elapsed(),
                 );
 
                 drop(cache);
 
-                if free_memory_kb > (total_memory_kb / 10) {
+                if free_memory_kb > (total_memory_kb / 2) {
                     println!("enough memory left, skipping kill");
                     continue;
                 }
@@ -639,22 +674,22 @@ fn main() {
 
                 loop {
                     if pidfd_send_signal(&pidfd, Signal::Kill).is_err() {
-                        println!("process killed in {:?} ({:?} total)", kill_start.elapsed(), start.elapsed());
+                        println!("<3>process killed in {:?} ({:?} total)", kill_start.elapsed(), start.elapsed());
                         break;
                     }
                     thread::yield_now();
                     if kill_start.elapsed().as_secs_f64() > 60.0 {
-                        println!("kill is taking too long");
+                        println!("<3>kill is taking too long");
                         break;
                     }
                 }
             }
         });
-        scope.spawn(|| {
-            if ENABLE_ZRAM_WRITEBACK {
+        if ENABLE_ZRAM_WRITEBACK {
+            scope.spawn(|| {
                 zram_util::init();
-            }
-        });
+            });
+        }
         scope.spawn(|| {
             let mut poll_pressure = PsiPoll::memory(100000, 1000000, PsiLevel::Full);
 
@@ -696,8 +731,8 @@ fn update_single_process(
     process_cache: &HashMap<u32, Option<ProcessHandle>>,
 ) {
     if process.executable.is_some() {
-        if is_critical(process, Some(state)) {
-            try_set_all(process, set_realtime);
+        if let Some(thread_filter) = get_critical_entry(process, Some(state)) {
+            try_set_all(process, thread_filter, set_realtime);
             if ENABLE_EXE_MLOCK {
                 handle_error(process.lock_executable());
             }
@@ -712,20 +747,20 @@ fn update_single_process(
                 handle_error(process.gdb_lock_all());
             }
             if ENABLE_MEMORY_READ {
-                dbg!(&process.read_all_maps());
+                dbg!(&process.read_all_maps(131072));
             }
         } else if is_child_of(
             process,
-            |parent| is_critical(parent, Some(state)),
+            |parent| get_critical_entry(parent, Some(state)).is_some(),
             process_cache,
         ) {
             let should_boost = is_equal_or_child_of(
                 process,
-                |parent| Some(parent.pid as _) == state.foreground_pid,
+                |parent| state.foreground_pid == Some(parent.pid),
                 process_cache,
             );
             if should_boost {
-                try_set_all(process, set_boosted);
+                try_set_all(process, None, set_boosted);
             } else if LOW_PRIORITY_PROCESSES.iter().any(|&x| {
                 process
                     .executable
@@ -733,9 +768,9 @@ fn update_single_process(
                     .and_then(|x| x.split('/').last())
                     == Some(x)
             }) {
-                try_set_all(process, set_low_priority);
+                try_set_all(process, None, set_low_priority);
             } else if FORCE_ASSIGN_NORMAL_SCHEDULER {
-                try_set_all(process, set_normal);
+                try_set_all(process, None, set_normal);
             }
         }
     }
