@@ -40,7 +40,7 @@ pub const GDB_MLOCK_PROCESSES: &[&str] = &[
     "/usr/bin/pipewire-media-session",
     "/usr/bin/wireplumber",
     "/usr/bin/easyeffects",
-    "/usr/bin/gnome-shell",
+    // "/usr/bin/gnome-shell",
     "/usr/bin/Xwayland",
     "/usr/lib/mutter-x11-frames",
     "/usr/bin/plasma-systemmonitor",

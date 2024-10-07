@@ -216,6 +216,14 @@ impl ProcessHandle {
         Ok(ProcStatus(proc_status))
     }
 
+    pub fn oom_score(&self) -> Result<usize> {
+        Ok(
+            read_string_from_dirfd(self.proc_dirfd.as_fd(), "oom_score")?
+                .trim()
+                .parse()?,
+        )
+    }
+
     pub fn from_pid(pid: u32) -> Result<Self> {
         let dirfd = open(format!("/proc/{pid}"), OFlags::DIRECTORY, Mode::empty())?;
         let proc_status = read_string_from_dirfd(dirfd.as_fd(), "status")?;

@@ -4,10 +4,10 @@ set -ev
 sudo -v
 
 cargo build --release
-cargo build --release --bin client
 
 sudo systemctl stop lemond
 sudo cp target/release/lemond /opt/lemond
+sudo cp target/release/pre-suspend /opt/lemond-pre-suspend
 sudo systemctl enable --now lemond
 
 # systemctl --user restart lemond-client

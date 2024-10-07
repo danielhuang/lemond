@@ -439,7 +439,7 @@ fn kernel_tweaks(revert: Option<Vec<String>>) -> Result<Vec<String>> {
         //     "/sys/module/zswap/parameters/max_pool_percent",
         //     "50".to_string(),
         // ),
-        ("/proc/sys/vm/swappiness", "1".to_string()),
+        // ("/proc/sys/vm/swappiness", "1".to_string()),
         // ("/proc/sys/vm/watermark_scale_factor", "1".to_string()),
         // ("/proc/sys/vm/watermark_boost_factor", "0".to_string()),
         // ("/proc/sys/vm/watermark_scale_factor", "2000".to_string()),
@@ -447,7 +447,7 @@ fn kernel_tweaks(revert: Option<Vec<String>>) -> Result<Vec<String>> {
         // ("/proc/sys/vm/watermark_boost_factor", "0".to_string()),
         // ("/proc/sys/vm/watermark_scale_factor", "125".to_string()),
         ("/proc/sys/vm/dirty_bytes", "268435456".to_string()),
-        // ("/proc/sys/vm/swappiness", "180".to_string()),
+        ("/proc/sys/vm/swappiness", "180".to_string()),
         (
             "/proc/sys/vm/dirty_background_bytes",
             "134217728".to_string(),
@@ -600,7 +600,7 @@ fn main() {
             let mut buf = String::with_capacity(32 * 1024);
 
             let mut mp = PsiReader::memory();
-            let mut poll_pressure = PsiPoll::memory(900000 * 2, 1000000 * 2,PsiLevel::Some);
+            let mut poll_pressure = PsiPoll::memory(900000 * 2, 1000000 * 2, PsiLevel::Full);
 
             let total_memory_kb = total_memory_kb();
 

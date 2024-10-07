@@ -1,4 +1,5 @@
 use color_eyre::eyre::Result;
+use libc::{sysconf, _SC_PAGESIZE};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -18,6 +19,13 @@ pub fn handle_error<T>(r: Result<T>) -> Option<T> {
         println!("{e:?}");
     }
     r.ok()
+}
+
+pub fn fault_in(mem: &mut [u8]) {
+    let page_size = unsafe { sysconf(_SC_PAGESIZE) };
+    for i in (0..mem.len()).step_by(page_size as usize) {
+        mem[i] += 1;
+    }
 }
 
 pub mod config;
