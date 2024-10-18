@@ -416,7 +416,7 @@ fn kernel_tweaks(revert: Option<Vec<String>>) -> Result<Vec<String>> {
         // ),
         // ("/proc/sys/vm/page_lock_unfairness", "1".to_string()),
         // ("/proc/sys/kernel/sched_child_runs_first", "0".to_string()),
-        ("/proc/sys/kernel/sched_autogroup_enabled", "0".to_string()),
+        // ("/proc/sys/kernel/sched_autogroup_enabled", "0".to_string()),
         // (
         //     "/proc/sys/kernel/sched_cfs_bandwidth_slice_us",
         //     "500".to_string(),
@@ -496,7 +496,7 @@ fn kernel_tweaks(revert: Option<Vec<String>>) -> Result<Vec<String>> {
 }
 
 fn main() {
-    set_var("RUST_BACKTRACE", "1");
+    unsafe { set_var("RUST_BACKTRACE", "1") };
 
     color_eyre::install().unwrap();
 
