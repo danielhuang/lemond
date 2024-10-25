@@ -8,7 +8,7 @@ cargo build --release
 sudo systemctl stop lemond
 sudo cp target/release/lemond /opt/lemond
 sudo cp target/release/pre-suspend /opt/lemond-pre-suspend
-sudo systemctl enable --now lemond
+sudo systemctl start lemond
 
 # systemctl --user restart lemond-client
 

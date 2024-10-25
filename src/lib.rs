@@ -41,6 +41,7 @@ pub fn alloc_fault_in(min_len: usize) -> MmapMut {
     mmap
 }
 
+pub mod autosuspend;
 pub mod config;
 pub mod oom;
 pub mod proc;

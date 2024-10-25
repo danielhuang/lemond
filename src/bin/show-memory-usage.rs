@@ -28,7 +28,7 @@ fn main() {
     let mut mem_usage_map = DefaultHashMap::with_default(0);
     for (mem_usage, handle) in pids {
         println!(
-            "pid={} {} mem={:.1}GB swap={:.1}GB total={:.1}GB oom_score={}",
+            "pid={} {} mem={:.2}GB swap={:.2}GB total={:.2}GB oom_score={}",
             handle.pid,
             handle.executable.as_ref().unwrap(),
             mem_usage.0 as f64 / 1000000.0,
@@ -42,7 +42,7 @@ fn main() {
     }
     println!();
     for (k, v) in mem_usage_map.iter().sorted_by_key(|x| x.1) {
-        println!("{k} {:.1}GB", *v as f64 / 1000000.0);
+        println!("{k} {:.2}GB", *v as f64 / 1000000.0);
     }
     println!();
     let kernel = read_to_string("/proc/sys/kernel/osrelease").unwrap();
@@ -50,7 +50,7 @@ fn main() {
     let swappiness = read_to_string("/proc/sys/vm/swappiness").unwrap();
     let swappiness = swappiness.trim();
     println!(
-        "kernel={kernel} swappiness={swappiness} total={:.1}GB",
+        "kernel={kernel} swappiness={swappiness} total={:.2}GB",
         total as f64 / 1000000.0
     );
 }

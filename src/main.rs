@@ -12,7 +12,7 @@ use lemond::config::{
 use lemond::oom::{PsiLevel, PsiPoll, PsiReader};
 use lemond::proc::{get_all_pids, process_mrelease};
 use lemond::procmon::ProcMon;
-use lemond::{extract_num, handle_error, zram_util, DEBUG};
+use lemond::{autosuspend, extract_num, handle_error, zram_util, DEBUG};
 use lemond::{proc::ProcessHandle, Message};
 use libc::{
     kill, mlockall, mmap, pid_t, rlimit, rlimit64, setpriority, waitpid, MCL_CURRENT, MCL_FUTURE,
@@ -593,6 +593,9 @@ fn main() {
             while running.load(Ordering::Acquire) {
                 populate_process_cache(&mut process_cache.lock().unwrap());
                 update_all_processes_once(&state.lock().unwrap(), &process_cache.lock().unwrap());
+
+                // autosuspend::run();
+
                 let _ = timer.sleep(Duration::from_millis(5000));
             }
         });
