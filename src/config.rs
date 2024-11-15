@@ -1,29 +1,26 @@
-pub const CRITICAL_PROCESSES: &[(&str, Option<&[&str]>)] = &[
-    ("/usr/bin/pipewire", None),
-    ("/usr/bin/pipewire-pulse", None),
-    ("/usr/bin/pipewire-media-session", None),
-    ("/usr/bin/wireplumber", None),
-    ("/usr/lib/systemd/systemd", None),
-    ("/usr/bin/pulseaudio", None),
-    ("/usr/bin/pulseeffects", None),
-    ("/usr/bin/easyeffects", None),
-    ("/usr/bin/kwin_wayland", None),
-    (
-        "/usr/bin/gnome-shell",
-        Some(&["gnome-shel:cs0", "gnome-shell", "gnome-sh:gdrv0"]),
-    ),
-    ("/usr/bin/Xwayland", None),
-    ("/usr/lib/Xorg", None),
-    ("/usr/bin/gnome-system-monitor", None),
-    ("/usr/bin/i3lock", None),
-    ("/usr/lib/systemd/systemd-oomd", None),
-    ("/usr/bin/ksysguard", None),
-    ("/usr/lib/ksysguard/ksgrd_network_helper", None),
-    ("/usr/bin/ksysguardd", None),
-    ("/usr/bin/Hyprland", None),
-    ("/usr/lib/mutter-x11-frames", None),
-    ("/usr/bin/plasma-systemmonitor", None),
-    ("/usr/bin/cosmic-comp", None),
+pub const CRITICAL_PROCESSES: &[&str] = &[
+    "/usr/bin/pipewire",
+    "/usr/bin/pipewire-pulse",
+    "/usr/bin/pipewire-media-session",
+    "/usr/bin/wireplumber",
+    "/usr/lib/systemd/systemd",
+    "/usr/bin/pulseaudio",
+    "/usr/bin/pulseeffects",
+    "/usr/bin/easyeffects",
+    "/usr/bin/kwin_wayland",
+    "/usr/bin/gnome-shell",
+    "/usr/bin/Xwayland",
+    "/usr/lib/Xorg",
+    "/usr/bin/gnome-system-monitor",
+    "/usr/bin/i3lock",
+    "/usr/lib/systemd/systemd-oomd",
+    "/usr/bin/ksysguard",
+    "/usr/lib/ksysguard/ksgrd_network_helper",
+    "/usr/bin/ksysguardd",
+    "/usr/bin/Hyprland",
+    "/usr/lib/mutter-x11-frames",
+    "/usr/bin/plasma-systemmonitor",
+    "/usr/bin/cosmic-comp",
 ];
 
 pub const EXCLUDE_REALTIME: &[&str] = &[
@@ -68,9 +65,12 @@ pub const ENABLE_NICE: bool = true;
 pub const ENABLE_SOCKET: bool = true;
 pub const ENABLE_EXE_MLOCK: bool = false;
 pub const ENABLE_LOCK_FDS: bool = false;
-pub const ENABLE_GDB_MLOCK: bool = true;
+pub const ENABLE_GDB_MLOCK: bool = false;
 pub const ENABLE_MEMORY_READ: bool = false;
 pub const ENABLE_ZRAM_WRITEBACK: bool = false;
+
+pub const ENABLE_SCHED_ADJ: bool = true;
+pub const ENABLE_OOM_KILLER: bool = true;
 
 pub const ENABLE_KERNEL_TWEAKS: bool = true;
 

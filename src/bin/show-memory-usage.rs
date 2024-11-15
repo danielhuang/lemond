@@ -25,7 +25,7 @@ fn main() {
     pids.sort_by_key(|x| x.0 .0 + x.0 .1);
     // pids.sort_by_key(|x| x.1.oom_score().unwrap());
     let mut total = 0;
-    let mut mem_usage_map = DefaultHashMap::with_default(0);
+    let mut mem_usage_map = DefaultHashMap::with_default((0, 0));
     for (mem_usage, handle) in pids {
         println!(
             "pid={} {} mem={:.2}GB swap={:.2}GB total={:.2}GB oom_score={}",
@@ -36,13 +36,18 @@ fn main() {
             (mem_usage.0 + mem_usage.1) as f64 / 1000000.0,
             handle.oom_score().unwrap(),
         );
-        mem_usage_map[handle.executable.clone().unwrap()] += mem_usage.0;
-        mem_usage_map[handle.executable.clone().unwrap()] += mem_usage.1;
+        mem_usage_map[handle.executable.clone().unwrap()].0 += mem_usage.0;
+        mem_usage_map[handle.executable.clone().unwrap()].1 += mem_usage.1;
         total += mem_usage.0 + mem_usage.1;
     }
     println!();
-    for (k, v) in mem_usage_map.iter().sorted_by_key(|x| x.1) {
-        println!("{k} {:.2}GB", *v as f64 / 1000000.0);
+    for (k, &(mem, swap)) in mem_usage_map.iter().sorted_by_key(|x| x.1 .0 + x.1 .1) {
+        println!(
+            "{k} mem={:.2}GB swap={:.2}GB total={:.2}GB",
+            mem as f64 / 1000000.0,
+            swap as f64 / 1000000.0,
+            (mem + swap) as f64 / 1000000.0
+        );
     }
     println!();
     let kernel = read_to_string("/proc/sys/kernel/osrelease").unwrap();
