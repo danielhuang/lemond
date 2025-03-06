@@ -18,7 +18,8 @@ fn main() {
                 let mut bufs = Vec::with_capacity(1024 * 1024);
 
                 while start.elapsed().as_secs() < 180 {
-                    let v = alloc_fault_in(amount * 1024 * 1024);
+                    let mut v = vec![0u8; amount * 1024 * 1024];
+                    v.fill(1);
                     black_box(&v);
                     bufs.push(v);
                     let total = total.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

@@ -4,7 +4,7 @@ use itertools::Itertools;
 use libc::{
     iovec, prlimit64, rlimit64, MCL_CURRENT, MCL_FUTURE, MCL_ONFAULT, RLIMIT_MEMLOCK, RLIM_INFINITY,
 };
-use memmap::Mmap;
+use memmap2::Mmap;
 use once_cell::sync::OnceCell;
 use rustix::fd::{AsFd, BorrowedFd};
 use rustix::fs::{open, openat, readlinkat, Dir, Mode, OFlags, RawDir};
@@ -73,7 +73,7 @@ pub struct ProcessMemoryRegion {
 }
 
 impl ProcessMemoryRegion {
-    pub unsafe fn as_remote_iovec(&self) -> iovec {
+    pub fn as_remote_iovec(&self) -> iovec {
         iovec {
             iov_base: self.address as _,
             iov_len: self.len,
@@ -152,7 +152,7 @@ impl ProcessHandle {
             println!("locking fds for {:?} ({})", self.executable, self.pid);
             let mut mmaps = vec![];
             for fd in self.all_fds()? {
-                let fd = pidfd_getfd(&self.pidfd, fd, PidfdGetfdFlags::empty());
+                let fd = pidfd_getfd(&self.proc_dirfd, fd, PidfdGetfdFlags::empty());
                 let Ok(fd) = fd else {
                     dbg!(&fd);
                     continue;
@@ -226,6 +226,11 @@ impl ProcessHandle {
 
     pub fn from_pid(pid: u32) -> Result<Self> {
         let dirfd = open(format!("/proc/{pid}"), OFlags::DIRECTORY, Mode::empty())?;
+        // Open pidfd between opening dirfd and accessing dirfd in case the pid no longer refers to the same process between opening dirfd and opening pidfd
+        let pidfd = Arc::new(pidfd_open(
+            Pid::from_raw(pid as _).unwrap(),
+            PidfdFlags::empty(),
+        )?);
         let proc_status = read_string_from_dirfd(dirfd.as_fd(), "status")?;
         let ppid = proc_status
             .lines()
@@ -244,11 +249,8 @@ impl ProcessHandle {
                 .ok()
                 .map(|x| x.to_string()),
             executable_mmap: Arc::new(OnceCell::new()),
+            pidfd,
             proc_dirfd: Arc::new(dirfd),
-            pidfd: Arc::new(pidfd_open(
-                Pid::from_raw(pid as _).unwrap(),
-                PidfdFlags::empty(),
-            )?),
             fd_mmaps: Arc::new(OnceCell::new()),
         })
     }

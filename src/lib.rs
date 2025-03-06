@@ -17,7 +17,7 @@ pub fn extract_num(s: &str, prefix: &str) -> Option<usize> {
 }
 
 #[track_caller]
-pub fn handle_error<T>(r: Result<T>) -> Option<T> {
+pub fn handle_error<T, E: std::fmt::Debug>(r: Result<T, E>) -> Option<T> {
     if let Err(e) = &r {
         println!("{e:?}");
     }
@@ -33,8 +33,9 @@ pub fn fault_in(mem: &mut [u8]) {
 
 pub fn alloc_fault_in(min_len: usize) -> MmapMut {
     let page_size = unsafe { sysconf(_SC_PAGESIZE) } as usize;
-    let len = (min_len + page_size - 1) / page_size * page_size;
+    let len = min_len.div_ceil(page_size) * page_size;
 
+    // for some reason, using memmap2 makes the allocations no longer concurrent
     let mut mmap = MmapOptions::new().len(len).map_anon().unwrap();
     unsafe { madvise(mmap.as_mut_ptr() as *mut _, len, libc::MADV_POPULATE_WRITE) };
 

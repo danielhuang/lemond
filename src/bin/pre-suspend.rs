@@ -1,10 +1,11 @@
 // https://gitlab.freedesktop.org/drm/amd/-/issues/2125#note_1708592
 // https://bbs.archlinux.org/viewtopic.php?id=293028
 
+use itertools::Itertools;
 use lemond::{alloc_fault_in, fault_in};
 use libc::{mlock, sysconf, _SC_PAGESIZE};
 use rayon::{iter::ParallelIterator, slice::ParallelSliceMut};
-use rustix::{event::pause, fs::sync};
+use rustix::{event::pause, fs::sync, path::Arg};
 use std::{
     fs::{read_dir, read_to_string, write},
     hint::black_box,
@@ -17,6 +18,19 @@ use std::{
 const MLOCK: bool = false;
 
 fn main() {
+    let uname = rustix::system::uname();
+    let uname = uname.release();
+    let uname = uname.as_str().unwrap();
+    let uname = uname.split('-').next().unwrap();
+    let version: Vec<u32> = uname.split('.').map(|x| x.parse().unwrap()).collect_vec();
+    if version >= vec![6, 14, 0] {
+        // https://nyanpasu64.gitlab.io/blog/amdgpu-sleep-wake-hang/
+        // https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c?h=v6.14-rc2
+        // https://gitlab.freedesktop.org/agd5f/linux/-/commit/2965e6355dcdf157b5fafa25a2715f00064da8bf
+        println!("kernel is new enough, skipping");
+        return;
+    }
+
     let mut total = 0;
 
     for dev in read_dir("/sys/bus/pci/devices/").unwrap() {
@@ -39,11 +53,6 @@ fn main() {
     dbg!(&total);
 
     thread::scope(|s| {
-        s.spawn(|| {
-            sync();
-            println!("sync done, took {:?}", start.elapsed());
-        });
-
         for i in 0..thread_count {
             s.spawn(move || {
                 let buf = alloc_fault_in(total / thread_count);

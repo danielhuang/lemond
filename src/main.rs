@@ -31,7 +31,7 @@ use signal_hook::iterator::Signals;
 use std::collections::HashSet;
 use std::env::set_var;
 use std::fs::{self, read_dir, read_to_string, remove_file, write, File};
-use std::io::{self, Read, Write};
+use std::io::{self, Cursor, Read, Write};
 use std::mem::size_of;
 use std::os::unix::fs::PermissionsExt;
 use std::process::id;
@@ -150,8 +150,17 @@ fn set_scheduler(pid: u32, policy: i32, nice: i32, prio: i32, reset_on_fork: boo
     }
 }
 
+fn set_autogroup_priority(p: &ProcessHandle, priority: i32) -> Result<()> {
+    let autogroup = openat(p.proc_dirfd.as_fd(), "autogroup", OFlags::WRONLY, Mode::empty())?;
+    let mut autogroup = File::from(autogroup);
+    let mut buf  = Cursor::new([0; 10]);
+    write!(buf, "{}", priority).unwrap();
+    let len = buf.position() as usize;
+    autogroup.write_all(&buf.into_inner()[..len])?;
+    Ok(())
+}
+
 fn set_realtime(p: &ProcessHandle, pid: u32) -> Result<()> {
-    let i = 10;
 
     let is_lemond = id() == p.pid;
 
@@ -182,11 +191,13 @@ fn set_realtime(p: &ProcessHandle, pid: u32) -> Result<()> {
                     pid,
                     libc::SCHED_FIFO,
                     REALTIME_NICE,
-                    99 - i,
+                    99 - CRITICAL_PROCESSES.iter().position(|&x| exe == x).unwrap_or(10) as i32,
                     !(is_lemond && LEMOND_SELF_REALTIME),
                 )?;
             }
         }
+        
+        set_autogroup_priority(p, REALTIME_NICE)?;
 
         setpriority_process(Some(Pid::from_raw(pid as _).unwrap()), REALTIME_NICE)?;
     }
@@ -345,6 +356,7 @@ fn cleanup() -> Result<()> {
             && is_equal_or_child_of(&process, |parent| is_critical(parent, None), &process_cache)
         {
             set_all(&process, set_normal)?;
+            set_autogroup_priority(&process, 0)?;
         }
     }
     Ok(())
@@ -385,7 +397,7 @@ fn kernel_tweaks(revert: Option<Vec<String>>) -> Result<Vec<String>> {
         // ),
         // ("/proc/sys/vm/page_lock_unfairness", "1".to_string()),
         // ("/proc/sys/kernel/sched_child_runs_first", "0".to_string()),
-        // ("/proc/sys/kernel/sched_autogroup_enabled", "0".to_string()),
+        ("/proc/sys/kernel/sched_autogroup_enabled", "0".to_string()),
         // (
         //     "/proc/sys/kernel/sched_cfs_bandwidth_slice_us",
         //     "500".to_string(),
@@ -408,7 +420,7 @@ fn kernel_tweaks(revert: Option<Vec<String>>) -> Result<Vec<String>> {
         //     "/sys/module/zswap/parameters/max_pool_percent",
         //     "50".to_string(),
         // ),
-        // ("/proc/sys/vm/swappiness", "1".to_string()),
+        ("/proc/sys/vm/swappiness", "180".to_string()),
         // ("/proc/sys/vm/watermark_scale_factor", "1".to_string()),
         // ("/proc/sys/vm/watermark_boost_factor", "0".to_string()),
         // ("/proc/sys/vm/watermark_scale_factor", "2000".to_string()),
@@ -416,7 +428,7 @@ fn kernel_tweaks(revert: Option<Vec<String>>) -> Result<Vec<String>> {
         // ("/proc/sys/vm/watermark_boost_factor", "0".to_string()),
         // ("/proc/sys/vm/watermark_scale_factor", "125".to_string()),
         ("/proc/sys/vm/dirty_bytes", "268435456".to_string()),
-        ("/proc/sys/vm/swappiness", "180".to_string()),
+        // ("/proc/sys/vm/swappiness", "180".to_string()),
         (
             "/proc/sys/vm/dirty_background_bytes",
             "134217728".to_string(),
@@ -439,7 +451,7 @@ fn kernel_tweaks(revert: Option<Vec<String>>) -> Result<Vec<String>> {
                 }
                 println!("reverting {path} back to {}", value.trim());
                 let mut file = File::create(path)?;
-                write!(&mut file, "{value}")?;
+                handle_error(write!(&mut file, "{value}"));
                 file.flush().unwrap();
             }
         }
@@ -505,74 +517,72 @@ fn main() {
                 socket_handler(&state, &running, &process_cache);
             });
         }
-            scope.spawn(|| {
-                signals.forever().next();
-                println!("exiting, setting processes back to normal");
+        scope.spawn(|| {
+            signals.forever().next();
+            println!("exiting, setting processes back to normal");
 
-                if let Some(kernel_tweaks_prev) = kernel_tweaks_prev {
-                    handle_error(kernel_tweaks(Some(kernel_tweaks_prev)));
-                }
+            if let Some(kernel_tweaks_prev) = kernel_tweaks_prev {
+                handle_error(kernel_tweaks(Some(kernel_tweaks_prev)));
+            }
 
-                running.store(false, Ordering::Release);
-                canceller.cancel().unwrap();
-                if let Err(e) = state.lock() {
-                    dbg!(&e);
-                }
+            running.store(false, Ordering::Release);
+            canceller.cancel().unwrap();
+            if let Err(e) = state.lock() {
+                dbg!(&e);
+            }
 
-                if ENABLE_SCHED_ADJ {
-                    handle_error(cleanup());
-                }
+            if ENABLE_SCHED_ADJ {
+                handle_error(cleanup());
+            }
 
-                process_cache.lock().unwrap().clear();
+            process_cache.lock().unwrap().clear();
 
-                exit(0);
-            });
-        if ENABLE_SCHED_ADJ {
-            scope.spawn(|| {
-                let mon = ProcMon::new();
+            exit(0);
+        });
+        scope.spawn(|| {
+            let mon = ProcMon::new();
 
-                populate_process_cache(&mut process_cache.lock().unwrap());
+            populate_process_cache(&mut process_cache.lock().unwrap());
 
-                while running.load(Ordering::Acquire) {
-                    let event = mon.wait_for_event();
+            while running.load(Ordering::Acquire) {
+                let event = mon.wait_for_event();
 
-                    let state = state.lock().unwrap();
+                let state = state.lock().unwrap();
 
-                    let mut process_cache = process_cache.lock().unwrap();
+                let mut process_cache = process_cache.lock().unwrap();
 
-                    match event.event_type {
-                        Some(lemond::procmon::EventType::Exec) => {
-                            if event.pid == event.tgid {
-                                let new_pid = event.pid;
-                                let process_info = ProcessHandle::from_pid(new_pid).ok();
-                                process_cache.insert(new_pid, process_info.clone());
-                                if let Some(process) = process_info {
-                                    update_single_process(&process, &state, &process_cache);
-                                }
+                match event.event_type {
+                    Some(lemond::procmon::EventType::Exec) => {
+                        if event.pid == event.tgid {
+                            let new_pid = event.pid;
+                            let process_info = ProcessHandle::from_pid(new_pid).ok();
+                            process_cache.insert(new_pid, process_info.clone());
+                            if let Some(process) = process_info {
+                                update_single_process(&process, &state, &process_cache);
                             }
                         }
-                        Some(lemond::procmon::EventType::Exit) => {
-                            let old_pid = event.pid;
-                            process_cache.remove(&old_pid);
-                        }
-                        _ => {}
                     }
+                    Some(lemond::procmon::EventType::Exit) => {
+                        let old_pid = event.pid;
+                        process_cache.remove(&old_pid);
+                    }
+                    _ => {}
                 }
-            });
-            scope.spawn(|| {
-                while running.load(Ordering::Acquire) {
-                    populate_process_cache(&mut process_cache.lock().unwrap());
-                    update_all_processes_once(
-                        &state.lock().unwrap(),
-                        &process_cache.lock().unwrap(),
-                    );
+            }
+        });
+        scope.spawn(|| {
+            while running.load(Ordering::Acquire) {
+                populate_process_cache(&mut process_cache.lock().unwrap());
+                update_all_processes_once(
+                    &state.lock().unwrap(),
+                    &process_cache.lock().unwrap(),
+                );
 
-                    // autosuspend::run();
+                // autosuspend::run();
 
-                    let _ = timer.sleep(Duration::from_millis(5000));
-                }
-            });
-        }
+                let _ = timer.sleep(Duration::from_millis(5000));
+            }
+        });
         if ENABLE_OOM_KILLER {
             scope.spawn(|| {
                 let mut buf = String::with_capacity(32 * 1024);
@@ -625,10 +635,7 @@ fn main() {
                         .max_by_key(|(_, _, x)| *x)
                         .unwrap();
     
-                    let Ok(pidfd) = handle.pidfd.try_clone() else {
-                        println!("failed to open pidfd (pid={pid})! does process not exist?");
-                        continue;
-                    };
+                    let pidfd = handle.pidfd.clone();
     
                     println!(
                         "<4>found target (pid={}, pidfd={pidfd:?} exe={:?} mem_used_kb={mem_used_kb:?} critical={}) took {:?} to find",
@@ -709,6 +716,10 @@ fn update_single_process(
     state: &State,
     process_cache: &HashMap<u32, Option<ProcessHandle>>,
 ) {
+    if !ENABLE_SCHED_ADJ {
+        return;
+    }
+    
     if process.executable.is_some() {
         if is_critical(process, Some(state)) {
             try_set_all(process, set_realtime);
